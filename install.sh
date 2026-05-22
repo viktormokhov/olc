@@ -169,6 +169,11 @@ fi
 configure_env "$FRESH_ENV"
 configure_ports
 
+# Docker bind-mounts need absolute HOST_DATA_DIR on the VPS
+ABS_DATA="$(cd "$ROOT/backend/data" && pwd)"
+env_set HOST_DATA_DIR "$ABS_DATA"
+echo "  HOST_DATA_DIR=${ABS_DATA} (absolute, for olcrtc bind mounts)"
+
 # shellcheck disable=SC1091
 set -a && source .env && set +a
 

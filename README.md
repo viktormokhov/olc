@@ -1,6 +1,6 @@
 # OlcPanel + olcrtc:patched
 
-Docker deployment for [OlcPanel](https://github.com/OpenLibreCommunity/OlcPanel) with **Telemost / VP8** patches and **`olcrtc:patched`** (universal-carrier, defer carrier reconnect, direct dial without local SOCKS).
+Docker deployment for **OlcPanel + Telemost / VP8** and **`olcrtc:patched`** (defer carrier reconnect, YAML config, direct dial without local SOCKS).
 
 ## Requirements
 
@@ -33,17 +33,16 @@ Verify:
 
 | Path | Purpose |
 |------|---------|
-| `docker-compose.yml` | bootstrap → build `olcrtc:patched` → backend, frontend, caddy |
-| `patches/` | Python patches applied on first build |
-| `olcrtc/` | Dockerfile for `olcrtc:patched` |
-| `backend/`, `frontend/` | Patched panel sources (bootstrap skips clone if present) |
+| `docker-compose.yml` | bootstrap check → build `olcrtc:patched` → backend, frontend, caddy |
+| `olcrtc/` | Dockerfile + `patch_defer_carrier.py` for `olcrtc:patched` |
+| `backend/`, `frontend/` | Telemost panel sources (required; not generated at install) |
 | `backend/data/examples/` | Sample config — copied to `backend/data/` by `init-data.sh` |
 | `Caddyfile` | HTTPS inside container on **808**, published as `PANEL_PORT` (`{$PANEL_DOMAIN}`, not `{env.*}`) |
 | `install.sh` | One-command install |
 | `docs/OLC_TELEMOST.md` | How client, srv, and Telemost connect |
 | `docs/olcbox_android_telemost.md` | Android Olcbox setup |
 
-**Not in git:** `.env`, `backend/data/*` (runtime secrets), `.bootstrap-done`
+**Not in git:** `.env`, `backend/data/*` (runtime secrets)
 
 ## Environment (`.env`)
 
@@ -62,11 +61,10 @@ See [`.env.example`](.env.example).
 ## Update / rebuild
 
 ```bash
-rm -f .bootstrap-done
-FORCE_BOOTSTRAP=1 docker compose up -d --build
+docker compose up -d --build
 ```
 
-In the panel: **Stop → Start** instance after image or YAML changes.
+In the panel: **Stop → Start** instance after image or room/YAML changes.
 
 ## Android client (Olcbox)
 

@@ -25,12 +25,26 @@ CONFIG_FILE = os.path.join(DATA_DIR, 'config.json')
 NODES_FILE = os.path.join(DATA_DIR, 'nodes.json')
 
 os.makedirs(DATA_DIR, exist_ok=True)
-HOST_DATA_DIR = os.environ.get('HOST_DATA_DIR', DATA_DIR)
-CONFIGS_DIR = os.path.join(HOST_DATA_DIR, 'configs')
+
+
+def resolve_host_bind_dir():
+    """Absolute path on the Docker host for olcrtc config bind-mounts."""
+    bind = (os.environ.get('HOST_BIND_DIR') or os.environ.get('HOST_DATA_DIR') or '').strip()
+    if bind.startswith('/app/'):
+        bind = (os.environ.get('HOST_BIND_DIR') or '').strip()
+    if bind and os.path.isabs(bind):
+        return bind.rstrip('/')
+    if bind:
+        return os.path.abspath(bind)
+    return DATA_DIR
+
+
+HOST_BIND_DIR = resolve_host_bind_dir()
+CONFIGS_DIR = os.path.join(DATA_DIR, 'configs')
 OLCRTC_IMAGE = os.environ.get('OLCRTC_IMAGE', 'olcrtc:patched')
 OLCRTC_SRV_PORT = int(os.environ.get('OLCRTC_SRV_PORT', '8801'))
-os.makedirs(os.path.join(DATA_DIR, 'configs'), exist_ok=True)
 os.makedirs(CONFIGS_DIR, exist_ok=True)
+last_start_error = ''
 
 SECRET_KEY = os.environ.get('SECRET_KEY', 'olcpanel-secret-key-change-me')
 docker_client = docker.DockerClient(base_url='unix://var/run/docker.sock')
@@ -48,19 +62,42 @@ TRANSPORTS = ['datachannel', 'vp8channel', 'seichannel', 'videochannel']
 TELEMOST_TRANSPORTS = frozenset({'vp8channel'})
 
 
+def extract_telemost_room_id(room_id):
+    text = str(room_id or '').strip()
+    m = re.search(
+        r'(?:https?://)?(?:www\.)?telemost\.yandex\.ru/j/([^/?#]+)',
+        text,
+        re.I,
+    )
+    return m.group(1) if m else text
+
+
 def normalize_room_id_for_carrier(carrier, room_id):
     if room_id is None:
         return room_id
     text = str(room_id).strip()
     if carrier == 'telemost':
-        m = re.search(
-            r'(?:https?://)?(?:www\.)?telemost\.yandex\.ru/j/([^/?#]+)',
-            text,
-            re.I,
-        )
-        rid = m.group(1) if m else text
+        rid = extract_telemost_room_id(text)
         return f'https://telemost.yandex.ru/j/{rid}'
     return text
+
+
+def build_telemost_qr_text(user):
+    """QR payload for olcbox: Telemost meeting ID and optional profile name."""
+    telemost_id = extract_telemost_room_id(user.get('room_id', ''))
+    name = (user.get('profile_name') or '').strip()
+    if name:
+        return f'{telemost_id}\n{name}'
+    return telemost_id
+
+
+def olcrtc_config_outdated(uid, user):
+    path = os.path.join(DATA_DIR, 'configs', f'olcrtc-{uid}.yaml')
+    if not os.path.isfile(path):
+        return True
+    with open(path, 'r', encoding='utf-8') as f:
+        current = yaml.safe_load(f) or {}
+    return current != build_olcrtc_yaml(user)
 
 
 def normalize_auth_provider(carrier):
@@ -139,11 +176,16 @@ def build_olcrtc_yaml(user):
 def write_olcrtc_config(uid, user):
     cfg = build_olcrtc_yaml(user)
     rel = os.path.join('configs', f'olcrtc-{uid}.yaml')
-    for base in (DATA_DIR, HOST_DATA_DIR):
-        os.makedirs(os.path.join(base, 'configs'), exist_ok=True)
-    host_path = os.path.join(HOST_DATA_DIR, rel)
-    with open(host_path, 'w', encoding='utf-8') as f:
+    data_path = os.path.join(DATA_DIR, rel)
+    os.makedirs(os.path.dirname(data_path), exist_ok=True)
+    with open(data_path, 'w', encoding='utf-8') as f:
         yaml.dump(cfg, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
+    host_path = os.path.join(HOST_BIND_DIR, rel)
+    if not os.path.isfile(host_path):
+        raise FileNotFoundError(
+            f'config not visible on Docker host at {host_path} '
+            f'(set HOST_DATA_DIR in .env to absolute path, e.g. /home/admin/OlcPanel/backend/data)'
+        )
     return host_path
 
 
@@ -155,11 +197,14 @@ def build_olcrtc_uri(user):
         ]
         if params_list:
             params_str = '<' + '&'.join(params_list) + '>'
+    room = user['room_id']
+    if user.get('carrier') == 'telemost':
+        room = extract_telemost_room_id(room)
     uri = (
         f"olcrtc://{user['carrier']}?{user['transport']}{params_str}"
-        f"@{user['room_id']}#{user['key']}"
+        f"@{room}#{user['key']}"
     )
-    mimo = user.get('profile_name') or ''
+    mimo = (user.get('profile_name') or '').strip()
     if mimo:
         uri += f"${mimo}"
     return uri
@@ -198,14 +243,21 @@ def load_users():
                     try:
                         container = docker_client.containers.get(user['container_id'])
                         if container.status == 'running':
-                            containers[uid] = container.id
-                            thread = threading.Thread(target=read_container_logs, args=(uid, container), daemon=True)
-                            thread.start()
-                            # Start traffic monitoring for srv mode
-                            if user.get('mode') == 'srv':
-                                traffic_thread = threading.Thread(target=read_traffic_stats, args=(uid,), daemon=True)
-                                traffic_thread.start()
-                            container_exists = True
+                            if olcrtc_config_outdated(uid, user):
+                                print(f"Instance {uid} config stale, restarting container")
+                                try:
+                                    container.remove(force=True)
+                                except Exception:
+                                    pass
+                            else:
+                                containers[uid] = container.id
+                                thread = threading.Thread(target=read_container_logs, args=(uid, container), daemon=True)
+                                thread.start()
+                                # Start traffic monitoring for srv mode
+                                if user.get('mode') == 'srv':
+                                    traffic_thread = threading.Thread(target=read_traffic_stats, args=(uid,), daemon=True)
+                                    traffic_thread.start()
+                                container_exists = True
                         else:
                             # Container exists but stopped, remove it
                             try:
@@ -450,6 +502,8 @@ def monitor_memory():
         time.sleep(5)  # Update every 5 seconds
 
 def start_olcrtc_container(uid):
+    global last_start_error
+    last_start_error = ''
     with lock:
         user = users[uid]
         node_id = user.get('node_id', 'local')
@@ -473,11 +527,12 @@ def start_olcrtc_container(uid):
                 pass
 
         cn = f'olcrtc-{uid}'
+        config_stale = olcrtc_config_outdated(uid, user)
         try:
             ex = docker_client.containers.get(cn)
             tags = ex.image.tags or []
             wrong_image = not any(OLCRTC_IMAGE in t for t in tags)
-            if ex.status == 'running' and not wrong_image:
+            if ex.status == 'running' and not wrong_image and not config_stale:
                 containers[uid] = ex.id
                 users[uid]['state'] = 'running'
                 users[uid]['container_id'] = ex.id
@@ -487,6 +542,8 @@ def start_olcrtc_container(uid):
                 if user.get('mode') == 'srv':
                     threading.Thread(target=read_traffic_stats, args=(uid,), daemon=True).start()
                 return True
+            if config_stale and ex.status == 'running':
+                print(f'Config changed for {cn}, recreating container')
             if wrong_image:
                 print(f'Removing {cn}: image {tags or ex.image.short_id}, want {OLCRTC_IMAGE}')
             ex.remove(force=True)
@@ -507,8 +564,8 @@ def start_olcrtc_container(uid):
 
         port_bindings = {}
         if user.get('mode') == 'cnc':
-            socks_port = user.get('socks_port', 1080)
-            port_bindings[1080] = socks_port
+            socks_port = int(user.get('socks_port', 1080))
+            port_bindings['1080/tcp'] = socks_port
 
         environment = {}
         if user.get('mode') == 'srv':
@@ -516,19 +573,19 @@ def start_olcrtc_container(uid):
             environment['SOCKS_PORT'] = '1081'
             environment['RX_LIMIT'] = str(user.get('rx_limit', 0))
             environment['TX_LIMIT'] = str(user.get('tx_limit', 0))
-            port_bindings[1081] = socks_port
+            port_bindings['1081/tcp'] = socks_port
             users[uid]['socks_port'] = socks_port
 
         try:
+            print(f'Starting olcrtc-{uid}: image={OLCRTC_IMAGE} config={config_host_path} ports={port_bindings}')
             container = docker_client.containers.run(
                 OLCRTC_IMAGE,
                 command=cmd,
                 detach=True,
                 name=f'olcrtc-{uid}',
-                ports=port_bindings,
-                environment=environment,
+                ports=port_bindings or None,
+                environment=environment or None,
                 volumes=volumes,
-                working_dir='/app',
                 remove=False,
                 network_mode='bridge',
             )
@@ -548,7 +605,11 @@ def start_olcrtc_container(uid):
 
             return True
         except Exception as e:
-            print(f"Error starting container: {e}")
+            last_start_error = str(e)
+            print(f'Error starting container: {e}')
+            users[uid]['state'] = 'stopped'
+            users[uid]['container_id'] = None
+            save_users()
             return False
 
 def start_remote_container(uid, node_id):
@@ -832,7 +893,8 @@ def start_user(uid):
 
     success = start_olcrtc_container(uid)
     if not success:
-        return jsonify({'success': False, 'error': 'Container failed to start'}), 500
+        msg = last_start_error or 'Container failed to start'
+        return jsonify({'success': False, 'error': msg}), 500
     return jsonify({'success': True})
 
 @app.route('/api/users/stop/<uid>', methods=['POST'])
@@ -909,10 +971,16 @@ def generate_uri(uid):
             params_str = '<' + '&'.join(params_list) + '>'
 
     uri = build_olcrtc_uri(user)
+    telemost_id = extract_telemost_room_id(user.get('room_id', ''))
+    profile_name = (user.get('profile_name') or '').strip()
+    qr_text = build_telemost_qr_text(user)
     return jsonify({
         'uri': uri,
+        'telemost_id': telemost_id,
+        'profile_name': profile_name,
+        'qr_text': qr_text,
         'olcbox_hint': (
-            'Universal olcrtc URI (no client-id). olcbox uses device install-id for VP8.'
+            'QR: Telemost ID + profile name. URI for Import from clipboard.'
         ),
     })
 

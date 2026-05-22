@@ -587,10 +587,9 @@ function App() {
   const generateQrCode = async (uid) => {
     try {
       const response = await axios.get(`/api/generate-uri/${uid}`);
-      const uri = response.data.uri;
+      const { qr_text, telemost_id, profile_name, uri } = response.data;
 
-      // Generate QR code as data URL
-      const qrDataUrl = await QRCode.toDataURL(uri, {
+      const qrDataUrl = await QRCode.toDataURL(qr_text, {
         width: 512,
         margin: 2,
         color: {
@@ -599,12 +598,13 @@ function App() {
         }
       });
 
-      const user = users.find(u => u.id === uid);
       setQrCodeData({
+        qrText: qr_text,
+        telemostId: telemost_id,
+        profileName: profile_name || '',
         uri,
         qrImage: qrDataUrl,
         instanceId: uid,
-        clientId: user?.client_id || 'Unknown'
       });
       setShowQrDialog(true);
     } catch (err) {
@@ -1503,9 +1503,9 @@ function App() {
           {qrCodeData && (
             <>
               <DialogHeader>
-                <DialogTitle>QR код инстанса #{qrCodeData.instanceId}</DialogTitle>
+                <DialogTitle>QR код — Telemost</DialogTitle>
                 <DialogDescription>
-                  Отсканируйте QR код для подключения
+                  ID встречи и имя профиля для olcbox
                 </DialogDescription>
               </DialogHeader>
               <div className="space-y-4 mt-4">
@@ -1518,24 +1518,41 @@ function App() {
                 </div>
 
                 <div className="space-y-2">
-                  <Label>URI</Label>
-                  <div className="p-2 bg-muted rounded font-mono text-xs break-all">
-                    {qrCodeData.uri}
+                  <Label>Telemost ID</Label>
+                  <div className="p-2 bg-muted rounded font-mono text-sm">
+                    {qrCodeData.telemostId}
                   </div>
                 </div>
 
-                <div className="flex gap-2">
+                {qrCodeData.profileName && (
+                  <div className="space-y-2">
+                    <Label>Profile Name</Label>
+                    <div className="p-2 bg-muted rounded text-sm">
+                      {qrCodeData.profileName}
+                    </div>
+                  </div>
+                )}
+
+                <div className="flex flex-wrap gap-2">
+                  <Button
+                    onClick={() => copyToClipboard(qrCodeData.qrText, 'QR данные')}
+                    variant="outline"
+                    className="flex-1 min-w-[140px]"
+                  >
+                    <Copy className="h-4 w-4 mr-2" />
+                    Копировать ID{qrCodeData.profileName ? ' + имя' : ''}
+                  </Button>
                   <Button
                     onClick={() => copyToClipboard(qrCodeData.uri, 'URI')}
                     variant="outline"
-                    className="flex-1"
+                    className="flex-1 min-w-[140px]"
                   >
                     <Copy className="h-4 w-4 mr-2" />
                     Копировать URI
                   </Button>
                   <Button
                     onClick={downloadQrCode}
-                    className="flex-1"
+                    className="flex-1 min-w-[140px]"
                   >
                     Скачать QR
                   </Button>

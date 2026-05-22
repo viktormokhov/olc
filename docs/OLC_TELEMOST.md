@@ -157,7 +157,7 @@ flowchart LR
   SRV --> OUT
 ```
 
-На **srv** отключён `socks.proxy 127.0.0.1:1081` — исходящие соединения с **IP VPS** (патч `olcpanel_srv_direct_dial`).
+На **srv** отключён `socks.proxy 127.0.0.1:1081` — исходящие соединения с **IP VPS** (в `backend/src/app.py`).
 
 ---
 
