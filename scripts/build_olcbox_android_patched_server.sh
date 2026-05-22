@@ -14,94 +14,12 @@ LOG=/tmp/build-olcbox-android.log
 exec > >(tee -a "$LOG") 2>&1
 echo "=== build started $(date -Is) ==="
 
-# --- patched olcrtc (defer reconnect + 90s handshake) ---
-python3 <<'PY' || true
-from pathlib import Path
-CLIENT = Path("/tmp/olcrtc-src/internal/client/client.go")
-SERVER = Path("/tmp/olcrtc-src/internal/server/server.go")
-HS = Path("/tmp/olcrtc-src/internal/handshake/handshake.go")
-
-# handshake 90s
-if HS.exists():
-    t = HS.read_text()
-    if "DefaultTimeout = 15 * time.Second" in t:
-        t = t.replace("DefaultTimeout = 15 * time.Second", "DefaultTimeout = 90 * time.Second")
-        HS.write_text(t)
-        print("patched handshake timeout")
-
-# defer reconnect (inline from olcrtc_defer_carrier_reconnect.py)
-old_c = """\tln.SetShouldReconnect(func() bool { return ctx.Err() == nil })
-\tln.SetReconnectCallback(func() {
-\t\tif ctx.Err() != nil {
-\t\t\treturn
-\t\t}
-\t\tif !c.handleReconnect(ctx, cfg, cancel, "carrier") {
-\t\t\tcancel()
-\t\t}
-\t})
-
-\tif err := ln.Connect(ctx); err != nil {"""
-new_c = """\tln.SetShouldReconnect(func() bool { return ctx.Err() == nil })
-\tln.SetReconnectCallback(func() {})
-
-\tif err := ln.Connect(ctx); err != nil {"""
-ins_c = """\tlogger.Infof("session %s opened (device=%s)", sid, c.deviceID)
-
-\tc.sessMu.Lock()"""
-reconnect_c = """\tlogger.Infof("session %s opened (device=%s)", sid, c.deviceID)
-
-\tln.SetReconnectCallback(func() {
-\t\tif ctx.Err() != nil {
-\t\t\treturn
-\t\t}
-\t\tif !c.handleReconnect(ctx, cfg, cancel, "carrier") {
-\t\t\tcancel()
-\t\t}
-\t})
-
-\tc.sessMu.Lock()"""
-if CLIENT.exists():
-    cs = CLIENT.read_text()
-    if old_c in cs:
-        cs = cs.replace(old_c, new_c, 1)
-        if ins_c in cs:
-            cs = cs.replace(ins_c, reconnect_c, 1)
-        CLIENT.write_text(cs)
-        print("patched client defer")
-old_s = """\tln.SetShouldReconnect(func() bool { return ctx.Err() == nil })
-\tln.SetReconnectCallback(func() {
-\t\tif ctx.Err() != nil {
-\t\t\treturn
-\t\t}
-\t\ts.handleReconnect()
-\t})
-
-\tlogger.Infof("Connecting transport=%s carrier=%s ...", cfg.Transport, cfg.Carrier)"""
-new_s = """\tln.SetShouldReconnect(func() bool { return ctx.Err() == nil })
-
-\tlogger.Infof("Connecting transport=%s carrier=%s ...", cfg.Transport, cfg.Carrier)"""
-ins_s = """\tlogger.Infof("Link connected")
-
-\ts.wg.Add(1)"""
-reconnect_s = """\tlogger.Infof("Link connected")
-
-\tln.SetReconnectCallback(func() {
-\t\tif ctx.Err() != nil {
-\t\t\treturn
-\t\t}
-\t\ts.handleReconnect()
-\t})
-
-\ts.wg.Add(1)"""
-if SERVER.exists():
-    ss = SERVER.read_text()
-    if old_s in ss:
-        ss = ss.replace(old_s, new_s, 1)
-        if ins_s in ss:
-            ss = ss.replace(ins_s, reconnect_s, 1)
-        SERVER.write_text(ss)
-        print("patched server defer")
-PY
+# --- patched olcrtc (defer reconnect + 90s handshake, olcrtc master) ---
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PATCH="$SCRIPT_DIR/../olcrtc/patch_defer_carrier.py"
+if [[ -f "$PATCH" ]] && [[ -d "$OLCRTC_SRC" ]]; then
+  python3 "$PATCH" "$OLCRTC_SRC" || true
+fi
 
 # --- Android SDK (one-time) ---
 if [[ ! -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" ]]; then
