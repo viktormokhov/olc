@@ -1,0 +1,133 @@
+# OlcPanel — всё в этой папке, запуск: cp .env.example .env && docker compose up -d --build
+# https://<PANEL_DOMAIN>:<PANEL_PORT>
+
+services:
+  bootstrap:
+    image: python:3.11-slim
+    container_name: olcpanel-bootstrap
+    working_dir: /olcpanel
+    volumes:
+      - .:/olcpanel
+    environment:
+      OLCPANEL_ROOT: /olcpanel
+      OLCPANEL_REPO: ${OLCPANEL_REPO:-https://github.com/OpenLibreCommunity/OlcPanel.git}
+      OLCPANEL_BRANCH: ${OLCPANEL_BRANCH:-main}
+    entrypoint: []
+    command:
+      - /bin/bash
+      - -c
+      - |
+        set -euo pipefail
+        apt-get update -qq
+        apt-get install -y -qq --no-install-recommends git
+        cd /olcpanel
+        if [ ! -f backend/src/app.py ]; then
+          echo ">>> Cloning OlcPanel upstream..."
+          git clone --depth 1 --branch "$${OLCPANEL_BRANCH}" "$${OLCPANEL_REPO}" /tmp/olcpanel-upstream
+          cp -a /tmp/olcpanel-upstream/backend /tmp/olcpanel-upstream/frontend .
+          rm -rf /tmp/olcpanel-upstream
+        fi
+        test -d patches && test -f scripts/apply-patches.py
+        if [ -f .bootstrap-done ] && [ "$${FORCE_BOOTSTRAP:-0}" != 1 ]; then
+          echo ">>> Patches already applied (.bootstrap-done). Set FORCE_BOOTSTRAP=1 to re-apply."
+        else
+          echo ">>> Applying patches..."
+          python3 scripts/apply-patches.py
+          touch .bootstrap-done
+        fi
+        echo ">>> Bootstrap done"
+    restart: "no"
+
+  olcrtc:
+    build:
+      context: ./olcrtc
+      dockerfile: Dockerfile
+    image: ${OLCRTC_IMAGE:-olcrtc:patched}
+    container_name: olcpanel-olcrtc-build
+    entrypoint: []
+    command: ["sh", "-c", "echo olcrtc image ready"]
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+    restart: "no"
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: olcpanel-caddy
+    ports:
+      - "${PANEL_PORT:-808}:808"
+    environment:
+      PANEL_DOMAIN: ${PANEL_DOMAIN:-panel.example.com}
+      ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL in .env for Let's Encrypt}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      backend:
+        condition: service_healthy
+      frontend:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - olcpanel-network
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: olcpanel-backend
+    expose:
+      - "3001"
+    environment:
+      NODE_ENV: production
+      PORT: "3001"
+      SECRET_KEY: ${SECRET_KEY:?set SECRET_KEY in .env}
+      HOST_DATA_DIR: ${HOST_DATA_DIR:-./backend/data}
+      OLCRTC_IMAGE: ${OLCRTC_IMAGE:-olcrtc:patched}
+      OLCRTC_SRV_PORT: ${OLCRTC_SRV_PORT:-8801}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${HOST_DATA_DIR:-./backend/data}:/app/data
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+      olcrtc:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    networks:
+      - olcpanel-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3001/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: olcpanel-frontend
+    expose:
+      - "80"
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    networks:
+      - olcpanel-network
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+networks:
+  olcpanel-network:
+    driver: bridge
+
+volumes:
+  caddy_data:
+  caddy_config:

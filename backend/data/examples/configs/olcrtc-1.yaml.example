@@ -1,0 +1,19 @@
+mode: srv
+auth:
+  provider: telemost
+room:
+  id: https://telemost.yandex.ru/j/YOUR_MEETING_ID
+crypto:
+  key: 0000000000000000000000000000000000000000000000000000000000000000
+net:
+  transport: vp8channel
+  dns: 1.1.1.1:53
+vp8:
+  fps: 60
+  batch_size: 64
+data: data
+debug: false
+liveness:
+  interval: 2m
+  timeout: 1m
+  failures: 30

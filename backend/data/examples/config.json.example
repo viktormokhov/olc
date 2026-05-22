@@ -1,0 +1,6 @@
+{
+  "username": "admin",
+  "password": "change-me",
+  "dns": "1.1.1.1:53",
+  "debug": false
+}

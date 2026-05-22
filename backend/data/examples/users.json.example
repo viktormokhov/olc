@@ -1,0 +1,23 @@
+{
+  "1": {
+    "client_id": "",
+    "key": "0000000000000000000000000000000000000000000000000000000000000000",
+    "room_id": "https://telemost.yandex.ru/j/YOUR_MEETING_ID",
+    "carrier": "telemost",
+    "transport": "vp8channel",
+    "mode": "srv",
+    "socks_port": 8801,
+    "transport_params": {
+      "vp8-batch": "64",
+      "vp8-fps": "60"
+    },
+    "debug": false,
+    "profile_name": "",
+    "dns": "1.1.1.1:53",
+    "node_id": "local",
+    "state": "stopped",
+    "container_id": "",
+    "rx_limit": 0,
+    "tx_limit": 0
+  }
+}

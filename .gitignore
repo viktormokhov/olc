@@ -1,0 +1,17 @@
+.env
+.bootstrap-done
+
+# Runtime data (use examples/ + scripts/init-data.sh)
+backend/data/*
+!backend/data/.gitkeep
+!backend/data/examples/
+!backend/data/examples/**
+
+.idea/
+app_windows/
+*.log
+hs_err_pid*.log
+
+# OS / editor
+.DS_Store
+Thumbs.db

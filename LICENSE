@@ -1,0 +1,7 @@
+This repository bundles deployment patches and configuration for OlcPanel and olcrtc.
+
+Upstream projects retain their original licenses:
+- https://github.com/OpenLibreCommunity/OlcPanel
+- https://github.com/openlibrecommunity/olcrtc
+
+Patches and deployment scripts in this repo are provided as-is without warranty.

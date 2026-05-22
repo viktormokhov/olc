@@ -1,0 +1,16 @@
+# Caddy: use {$VAR}, not {env.VAR}. Env from docker-compose (PANEL_DOMAIN, ACME_EMAIL).
+{
+	email {$ACME_EMAIL}
+}
+
+https://{$PANEL_DOMAIN}:808 {
+	encode gzip
+
+	handle /api/* {
+		reverse_proxy backend:3001
+	}
+
+	handle {
+		reverse_proxy frontend:80
+	}
+}

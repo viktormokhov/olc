@@ -1,0 +1,1231 @@
+import os
+import re
+import yaml
+import json
+import subprocess
+import threading
+import time
+import psutil
+import docker
+import jwt
+import requests
+from datetime import datetime, timedelta
+from collections import deque
+from flask import Flask, jsonify, request, Response
+from flask_cors import CORS
+from functools import wraps
+
+app = Flask(__name__)
+CORS(app)
+
+# Fix: Use /app/data instead of /app/src/data
+DATA_DIR = '/app/data'
+USERS_FILE = os.path.join(DATA_DIR, 'users.json')
+CONFIG_FILE = os.path.join(DATA_DIR, 'config.json')
+NODES_FILE = os.path.join(DATA_DIR, 'nodes.json')
+
+os.makedirs(DATA_DIR, exist_ok=True)
+HOST_DATA_DIR = os.environ.get('HOST_DATA_DIR', DATA_DIR)
+CONFIGS_DIR = os.path.join(HOST_DATA_DIR, 'configs')
+OLCRTC_IMAGE = os.environ.get('OLCRTC_IMAGE', 'olcrtc:patched')
+OLCRTC_SRV_PORT = int(os.environ.get('OLCRTC_SRV_PORT', '8801'))
+os.makedirs(os.path.join(DATA_DIR, 'configs'), exist_ok=True)
+os.makedirs(CONFIGS_DIR, exist_ok=True)
+
+SECRET_KEY = os.environ.get('SECRET_KEY', 'olcpanel-secret-key-change-me')
+docker_client = docker.DockerClient(base_url='unix://var/run/docker.sock')
+
+users = {}
+containers = {}
+logs = {}
+traffic_stats = {}
+memory_stats = {}
+nodes = {}
+lock = threading.RLock()
+
+CARRIERS = ['telemost']
+TRANSPORTS = ['datachannel', 'vp8channel', 'seichannel', 'videochannel']
+TELEMOST_TRANSPORTS = frozenset({'vp8channel'})
+
+
+def normalize_room_id_for_carrier(carrier, room_id):
+    if room_id is None:
+        return room_id
+    text = str(room_id).strip()
+    if carrier == 'telemost':
+        m = re.search(
+            r'(?:https?://)?(?:www\.)?telemost\.yandex\.ru/j/([^/?#]+)',
+            text,
+            re.I,
+        )
+        rid = m.group(1) if m else text
+        return f'https://telemost.yandex.ru/j/{rid}'
+    return text
+
+
+def normalize_auth_provider(carrier):
+    return (carrier or 'telemost').lower()
+
+
+def validate_carrier_transport_pair(carrier, transport):
+    if carrier == 'telemost' and transport not in TELEMOST_TRANSPORTS:
+        return (
+            'telemost supports only vp8channel (use olcbox VP8); '
+            'create a meeting at https://telemost.yandex.ru/ and paste the link or room id'
+        )
+    return None
+
+
+def transport_params_to_yaml(transport, tp):
+    tp = tp or {}
+    if transport == 'vp8channel':
+        return {
+            'vp8': {
+                'fps': int(tp.get('vp8-fps', 60)),
+                'batch_size': int(tp.get('vp8-batch', 64)),
+            }
+        }
+    if transport == 'seichannel':
+        return {
+            'sei': {
+                'fps': int(tp.get('fps', 60)),
+                'batch_size': int(tp.get('batch', 64)),
+                'fragment_size': int(tp.get('frag', 900)),
+                'ack_timeout_ms': int(tp.get('ack_timeout', 2000)),
+            }
+        }
+    if transport == 'videochannel':
+        res = str(tp.get('resolution', '1920x1080')).split('x')
+        w, h = (res[0], res[1]) if len(res) == 2 else ('1920', '1080')
+        return {
+            'video': {
+                'codec': tp.get('codec', 'qrcode'),
+                'width': int(w),
+                'height': int(h),
+                'fps': int(tp.get('fps', 30)),
+                'bitrate': str(tp.get('bitrate', '2M')),
+                'hw': 'nvenc' if tp.get('hw_accel') else 'none',
+            }
+        }
+    return {}
+
+
+def build_olcrtc_yaml(user):
+    provider = normalize_auth_provider(user.get('carrier'))
+    transport = user.get('transport', 'vp8channel')
+    mode = user.get('mode', 'srv')
+    cfg = {
+        'mode': mode,
+        'auth': {'provider': provider},
+        'room': {'id': str(user['room_id'])},
+        'crypto': {'key': user['key']},
+        'net': {
+            'transport': transport,
+            'dns': user.get('dns') or load_config().get('dns', '1.1.1.1:53'),
+        },
+        'data': 'data',
+    }
+    cfg.update(transport_params_to_yaml(transport, user.get('transport_params')))
+    if mode == "cnc":
+        cfg['socks'] = {
+            'host': '127.0.0.1',
+            'port': int(user.get('socks_port', 1080)),
+        }
+    if load_config().get('debug') or user.get('debug'):
+        cfg['debug'] = True
+    return cfg
+
+
+def write_olcrtc_config(uid, user):
+    cfg = build_olcrtc_yaml(user)
+    rel = os.path.join('configs', f'olcrtc-{uid}.yaml')
+    for base in (DATA_DIR, HOST_DATA_DIR):
+        os.makedirs(os.path.join(base, 'configs'), exist_ok=True)
+    host_path = os.path.join(HOST_DATA_DIR, rel)
+    with open(host_path, 'w', encoding='utf-8') as f:
+        yaml.dump(cfg, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
+    return host_path
+
+
+def build_olcrtc_uri(user):
+    params_str = ''
+    if user.get('transport_params'):
+        params_list = [
+            f"{k}={v}" for k, v in user['transport_params'].items() if v is not None and v != ''
+        ]
+        if params_list:
+            params_str = '<' + '&'.join(params_list) + '>'
+    uri = (
+        f"olcrtc://{user['carrier']}?{user['transport']}{params_str}"
+        f"@{user['room_id']}#{user['key']}"
+    )
+    mimo = user.get('profile_name') or ''
+    if mimo:
+        uri += f"${mimo}"
+    return uri
+
+
+TRANSPORT_PARAMS = {
+    'datachannel': [],
+    'vp8channel': [
+        {'name': 'vp8-fps', 'type': 'text', 'default': '60', 'label': 'FPS'},
+        {'name': 'vp8-batch', 'type': 'text', 'default': '64', 'label': 'Batch Size'}
+    ],
+    'seichannel': [
+        {'name': 'fps', 'type': 'text', 'default': '25', 'label': 'FPS'},
+        {'name': 'batch', 'type': 'text', 'default': '1', 'label': 'Batch Size'},
+        {'name': 'frag', 'type': 'text', 'default': '900', 'label': 'Fragment Size (bytes)'},
+        {'name': 'ack_timeout', 'type': 'text', 'default': '2000', 'label': 'ACK Timeout (ms)'}
+    ],
+    'videochannel': [
+        {'name': 'codec', 'type': 'select', 'options': ['qrcode', 'tile'], 'default': 'qrcode', 'label': 'Codec'},
+        {'name': 'resolution', 'type': 'text', 'default': '640x480', 'label': 'Resolution'},
+        {'name': 'bitrate', 'type': 'text', 'default': '500000', 'label': 'Bitrate'},
+        {'name': 'hw_accel', 'type': 'checkbox', 'default': False, 'label': 'Hardware Acceleration'}
+    ]
+}
+
+def load_users():
+    global users
+    if os.path.exists(USERS_FILE):
+        with open(USERS_FILE, 'r') as f:
+            users = json.load(f)
+        # Restore and restart containers
+        for uid, user in users.items():
+            if user.get('state') == 'running':
+                container_exists = False
+                if user.get('container_id'):
+                    try:
+                        container = docker_client.containers.get(user['container_id'])
+                        if container.status == 'running':
+                            containers[uid] = container.id
+                            thread = threading.Thread(target=read_container_logs, args=(uid, container), daemon=True)
+                            thread.start()
+                            # Start traffic monitoring for srv mode
+                            if user.get('mode') == 'srv':
+                                traffic_thread = threading.Thread(target=read_traffic_stats, args=(uid,), daemon=True)
+                                traffic_thread.start()
+                            container_exists = True
+                        else:
+                            # Container exists but stopped, remove it
+                            try:
+                                container.remove()
+                            except:
+                                pass
+                    except:
+                        pass
+
+                # If container doesn't exist or was stopped, restart it
+                if not container_exists:
+                    print(f"Restarting instance {uid} ({user.get('client_id')})")
+                    try:
+                        start_olcrtc_container(uid)
+                    except Exception as e:
+                        print(f"Failed to restart instance {uid}: {e}")
+                        user['state'] = 'stopped'
+                        user['container_id'] = None
+        save_users()
+    else:
+        users = {}
+
+def save_users():
+    with open(USERS_FILE, 'w') as f:
+        json.dump(users, f, indent=2)
+
+def load_config():
+    if os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE, 'r') as f:
+            return json.load(f)
+    default_config = {
+        'username': 'admin',
+        'password': 'admin',
+        'dns': '1.1.1.1:53',
+        'debug': False
+    }
+    save_config(default_config)
+    return default_config
+
+def save_config(config):
+    with open(CONFIG_FILE, 'w') as f:
+        json.dump(config, f, indent=2)
+
+def load_nodes():
+    global nodes
+    if os.path.exists(NODES_FILE):
+        with open(NODES_FILE, 'r') as f:
+            nodes = json.load(f)
+    else:
+        nodes = {}
+
+def save_nodes():
+    with open(NODES_FILE, 'w') as f:
+        json.dump(nodes, f, indent=2)
+
+def check_node_status(node_id):
+    """Check if a node is online"""
+    try:
+        node = nodes.get(node_id)
+        if not node:
+            return False
+
+        url = f"http://{node['host']}:{node['port']}/health"
+        response = requests.get(url, timeout=5)
+        return response.status_code == 200
+    except:
+        return False
+
+def monitor_nodes():
+    """Background thread to monitor node health"""
+    while True:
+        try:
+            with lock:
+                for node_id in list(nodes.keys()):
+                    is_online = check_node_status(node_id)
+                    nodes[node_id]['status'] = 'online' if is_online else 'offline'
+                save_nodes()
+        except Exception as e:
+            print(f"Error monitoring nodes: {e}")
+
+        time.sleep(10)  # Check every 10 seconds
+
+def call_node_api(node_id, method, endpoint, data=None):
+    """Call remote node API"""
+    if node_id not in nodes:
+        raise Exception(f"Node {node_id} not found")
+
+    node = nodes[node_id]
+    url = f"http://{node['host']}:{node['port']}{endpoint}"
+    headers = {'X-Node-Token': node['token']}
+
+    try:
+        if method == 'GET':
+            response = requests.get(url, headers=headers, timeout=10)
+        elif method == 'POST':
+            response = requests.post(url, headers=headers, json=data, timeout=10)
+        elif method == 'DELETE':
+            response = requests.delete(url, headers=headers, timeout=10)
+
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        raise Exception(f"Node API call failed: {str(e)}")
+
+
+def require_auth(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        token = request.headers.get('Authorization')
+        if not token:
+            return jsonify({'error': 'No token provided'}), 401
+
+        try:
+            if token.startswith('Bearer '):
+                token = token[7:]
+            jwt.decode(token, SECRET_KEY, algorithms=['HS256'])
+        except jwt.ExpiredSignatureError:
+            return jsonify({'error': 'Token expired'}), 401
+        except jwt.InvalidTokenError:
+            return jsonify({'error': 'Invalid token'}), 401
+
+        return f(*args, **kwargs)
+    return decorated
+
+@app.route('/api/login', methods=['POST'])
+def login():
+    data = request.json
+    username = data.get('username')
+    password = data.get('password')
+
+    config = load_config()
+    if username == config.get('username', 'admin') and password == config.get('password', 'admin'):
+        token = jwt.encode({
+            'username': username,
+            'exp': datetime.utcnow() + timedelta(days=7)
+        }, SECRET_KEY, algorithm='HS256')
+        return jsonify({'token': token})
+
+    return jsonify({'error': 'Invalid credentials'}), 401
+
+def build_olcrtc_command(user):
+    return ['/config/config.yaml']
+
+
+def read_container_logs(uid, container):
+    logs[uid] = deque(maxlen=1000)
+    try:
+        for line in container.logs(stream=True, follow=True):
+            with lock:
+                log_line = line.decode('utf-8', errors='ignore').strip()
+                logs[uid].append(log_line)
+    except:
+        pass
+
+def read_traffic_stats(uid):
+    """Read traffic statistics from SOCKS5 proxy stats file"""
+    print(f"Starting traffic monitoring for instance {uid}", flush=True)
+
+    stats_file_path = '/tmp/socks.stats'
+
+    while uid in containers:
+        try:
+            container = docker_client.containers.get(containers[uid])
+            if container.status != 'running':
+                print(f"Container {uid} not running, stopping traffic monitoring", flush=True)
+                break
+
+            # Check if stats file exists
+            test_result = container.exec_run(f'test -f {stats_file_path}', demux=False)
+            if test_result.exit_code != 0:
+                # File doesn't exist yet, wait for next iteration
+                time.sleep(5)
+                continue
+
+            exec_result = container.exec_run(f'cat {stats_file_path}', demux=False)
+
+            if exec_result.exit_code == 0:
+                stats_data = exec_result.output.decode('utf-8', errors='ignore').strip()
+                print(f"Raw stats data for {uid}: {stats_data}", flush=True)
+
+                if stats_data:
+                    try:
+                        # Parse stats format: "rx_bytes tx_bytes"
+                        parts = stats_data.split()
+                        if len(parts) >= 2:
+                            rx_bytes = int(parts[0])
+                            tx_bytes = int(parts[1])
+                            current_time = time.time()
+
+                            with lock:
+                                # Calculate speed if we have previous data
+                                rx_speed = 0
+                                tx_speed = 0
+                                if uid in traffic_stats:
+                                    prev_stats = traffic_stats[uid]
+                                    time_diff = current_time - prev_stats['last_update']
+                                    if time_diff > 0:
+                                        rx_speed = (rx_bytes - prev_stats['rx_bytes']) / time_diff / 1024  # KB/s
+                                        tx_speed = (tx_bytes - prev_stats['tx_bytes']) / time_diff / 1024  # KB/s
+
+                                traffic_stats[uid] = {
+                                    'rx_bytes': rx_bytes,
+                                    'tx_bytes': tx_bytes,
+                                    'rx_mb': round(rx_bytes / 1024 / 1024, 2),
+                                    'tx_mb': round(tx_bytes / 1024 / 1024, 2),
+                                    'total_mb': round((rx_bytes + tx_bytes) / 1024 / 1024, 2),
+                                    'rx_speed': round(rx_speed, 2),
+                                    'tx_speed': round(tx_speed, 2),
+                                    'last_update': current_time
+                                }
+                                print(f"Updated traffic stats for {uid}: RX={traffic_stats[uid]['rx_mb']}MB TX={traffic_stats[uid]['tx_mb']}MB Speed: RX={traffic_stats[uid]['rx_speed']}KB/s TX={traffic_stats[uid]['tx_speed']}KB/s", flush=True)
+                    except (ValueError, IndexError) as e:
+                        print(f"Error parsing traffic stats for {uid}: {e}", flush=True)
+        except Exception as e:
+            print(f"Error reading traffic stats for {uid}: {e}", flush=True)
+
+        time.sleep(5)
+
+    print(f"Stopping traffic monitoring for instance {uid}", flush=True)
+    with lock:
+        if uid in traffic_stats:
+            del traffic_stats[uid]
+
+def monitor_memory():
+    """Background thread to monitor container memory usage"""
+    while True:
+        try:
+            with lock:
+                for uid in list(containers.keys()):
+                    try:
+                        container = docker_client.containers.get(containers[uid])
+                        if container.status == 'running':
+                            stats = container.stats(stream=False)
+                            memory_usage = stats['memory_stats'].get('usage', 0)
+                            memory_stats[uid] = round(memory_usage / (1024 * 1024), 1)
+                    except:
+                        if uid in memory_stats:
+                            del memory_stats[uid]
+        except Exception as e:
+            print(f"Error monitoring memory: {e}")
+
+        time.sleep(5)  # Update every 5 seconds
+
+def start_olcrtc_container(uid):
+    with lock:
+        user = users[uid]
+        node_id = user.get('node_id', 'local')
+
+        # Check if running on remote node
+        if node_id != 'local':
+            return start_remote_container(uid, node_id)
+
+        # Local container logic
+        if uid in containers:
+            try:
+                container = docker_client.containers.get(containers[uid])
+                if container.status == 'running':
+                    # Container already running, just ensure log thread exists
+                    if uid not in logs or len(logs[uid]) == 0:
+                        thread = threading.Thread(target=read_container_logs, args=(uid, container), daemon=True)
+                        thread.start()
+                    return True
+                container.remove()
+            except:
+                pass
+
+        cn = f'olcrtc-{uid}'
+        try:
+            ex = docker_client.containers.get(cn)
+            tags = ex.image.tags or []
+            wrong_image = not any(OLCRTC_IMAGE in t for t in tags)
+            if ex.status == 'running' and not wrong_image:
+                containers[uid] = ex.id
+                users[uid]['state'] = 'running'
+                users[uid]['container_id'] = ex.id
+                save_users()
+                if uid not in logs or len(logs[uid]) == 0:
+                    threading.Thread(target=read_container_logs, args=(uid, ex), daemon=True).start()
+                if user.get('mode') == 'srv':
+                    threading.Thread(target=read_traffic_stats, args=(uid,), daemon=True).start()
+                return True
+            if wrong_image:
+                print(f'Removing {cn}: image {tags or ex.image.short_id}, want {OLCRTC_IMAGE}')
+            ex.remove(force=True)
+        except docker.errors.NotFound:
+            pass
+        except Exception as e:
+            print(f'clean {cn}: {e}')
+            try:
+                ex.remove(force=True)
+            except Exception:
+                pass
+
+        config_host_path = write_olcrtc_config(uid, user)
+        cmd = build_olcrtc_command(user)
+        volumes = {
+            config_host_path: {'bind': '/config/config.yaml', 'mode': 'ro'},
+        }
+
+        port_bindings = {}
+        if user.get('mode') == 'cnc':
+            socks_port = user.get('socks_port', 1080)
+            port_bindings[1080] = socks_port
+
+        environment = {}
+        if user.get('mode') == 'srv':
+            socks_port = int(user.get('socks_port') or (OLCRTC_SRV_PORT + int(uid) - 1))
+            environment['SOCKS_PORT'] = '1081'
+            environment['RX_LIMIT'] = str(user.get('rx_limit', 0))
+            environment['TX_LIMIT'] = str(user.get('tx_limit', 0))
+            port_bindings[1081] = socks_port
+            users[uid]['socks_port'] = socks_port
+
+        try:
+            container = docker_client.containers.run(
+                OLCRTC_IMAGE,
+                command=cmd,
+                detach=True,
+                name=f'olcrtc-{uid}',
+                ports=port_bindings,
+                environment=environment,
+                volumes=volumes,
+                working_dir='/app',
+                remove=False,
+                network_mode='bridge',
+            )
+
+            containers[uid] = container.id
+            users[uid]['state'] = 'running'
+            users[uid]['container_id'] = container.id
+            save_users()
+
+            thread = threading.Thread(target=read_container_logs, args=(uid, container), daemon=True)
+            thread.start()
+
+            # Start traffic monitoring for srv mode
+            if user.get('mode') == 'srv':
+                traffic_thread = threading.Thread(target=read_traffic_stats, args=(uid,), daemon=True)
+                traffic_thread.start()
+
+            return True
+        except Exception as e:
+            print(f"Error starting container: {e}")
+            return False
+
+def start_remote_container(uid, node_id):
+    """Start container on remote node"""
+    user = users[uid]
+    config_host_path = write_olcrtc_config(uid, user)
+    cmd = build_olcrtc_command(user)
+
+    port_bindings = {}
+    environment = {}
+
+    if user.get('mode') == 'cnc':
+        socks_port = user.get('socks_port', 1080)
+        port_bindings['1080/tcp'] = socks_port
+    elif user.get('mode') == 'srv':
+        socks_port = int(user.get('socks_port') or (OLCRTC_SRV_PORT + int(uid) - 1))
+        environment['SOCKS_PORT'] = '1081'
+        environment['RX_LIMIT'] = str(user.get('rx_limit', 0))
+        environment['TX_LIMIT'] = str(user.get('tx_limit', 0))
+        port_bindings['1081/tcp'] = socks_port
+        users[uid]['socks_port'] = socks_port
+
+    try:
+        result = call_node_api(node_id, 'POST', '/containers/start', {
+            'image': OLCRTC_IMAGE,
+            'command': cmd,
+            'config_path': config_host_path,
+            'name': f'olcrtc-{uid}',
+            'ports': port_bindings,
+            'environment': environment,
+            'network_mode': 'bridge'
+        })
+
+        containers[uid] = result['container_id']
+        users[uid]['state'] = 'running'
+        users[uid]['container_id'] = result['container_id']
+        save_users()
+
+        return True
+    except Exception as e:
+        print(f"Error starting remote container: {e}")
+        return False
+
+def stop_olcrtc_container(uid):
+    with lock:
+        user = users.get(uid)
+        if not user:
+            return True
+
+        node_id = user.get('node_id', 'local')
+
+        # Stop remote container
+        if node_id != 'local':
+            try:
+                container_id = user.get('container_id')
+                if container_id:
+                    call_node_api(node_id, 'POST', f'/containers/{container_id}/stop')
+            except Exception as e:
+                print(f"Error stopping remote container: {e}")
+
+            if uid in containers:
+                del containers[uid]
+            users[uid]['state'] = 'stopped'
+            users[uid]['container_id'] = None
+            save_users()
+            return True
+
+        # Stop local container
+        if uid in containers:
+            try:
+                container = docker_client.containers.get(containers[uid])
+                container.stop(timeout=5)
+                container.remove()
+            except:
+                pass
+            del containers[uid]
+
+        if uid in users:
+            users[uid]['state'] = 'stopped'
+            users[uid]['container_id'] = None
+            save_users()
+
+        return True
+
+@app.route('/api/health', methods=['GET'])
+def health():
+    return jsonify({'status': 'ok', 'timestamp': time.time()})
+
+@app.route('/api/status', methods=['GET'])
+@require_auth
+def status():
+    with lock:
+        cpu_percent = psutil.cpu_percent(interval=0.1)
+        mem = psutil.virtual_memory()
+
+        user_list = []
+        for uid, user in users.items():
+            user_data = {
+                'id': uid,
+                'client_id': user['client_id'],
+                'carrier': user.get('carrier', 'telemost'),
+                'transport': user.get('transport', 'datachannel'),
+                'mode': user.get('mode', 'cnc'),
+                'state': user.get('state', 'stopped'),
+                'container_id': user.get('container_id'),
+                'socks_port': user.get('socks_port', 1080),
+                'node_id': user.get('node_id', 'local'),
+                'memory_mb': memory_stats.get(uid, 0)
+            }
+            user_list.append(user_data)
+
+        return jsonify({
+            'users': user_list,
+            'server': {
+                'cpu_percent': cpu_percent,
+                'mem_percent': mem.percent,
+                'mem_used': mem.used,
+                'mem_total': mem.total
+            }
+        })
+
+@app.route('/api/carriers', methods=['GET'])
+@require_auth
+def get_carriers():
+    return jsonify({'carriers': CARRIERS})
+
+@app.route('/api/transports-for/<carrier>', methods=['GET'])
+@require_auth
+def get_transports_for_carrier(carrier):
+    if carrier == 'telemost':
+        return jsonify({'transports': ['vp8channel']})
+    return jsonify({'transports': TRANSPORTS})
+
+@app.route('/api/transports', methods=['GET'])
+@require_auth
+def get_transports():
+    return jsonify({'transports': TRANSPORTS})
+
+@app.route('/api/transport-params/<transport>', methods=['GET'])
+@require_auth
+def get_transport_params(transport):
+    params = TRANSPORT_PARAMS.get(transport, [])
+    return jsonify({'params': params})
+
+@app.route('/api/users/add', methods=['POST'])
+@require_auth
+def add_user():
+    data = request.json
+
+    required = ['key', 'room_id', 'carrier', 'transport']
+    for field in required:
+        if not data.get(field):
+            return jsonify({'error': f'{field} is required'}), 400
+
+    carrier = data['carrier']
+    transport = data['transport']
+    err = validate_carrier_transport_pair(carrier, transport)
+    if err:
+        return jsonify({'error': err}), 400
+    room_id = normalize_room_id_for_carrier(carrier, data['room_id'])
+
+    with lock:
+        uid = str(len(users) + 1)
+        users[uid] = {
+            'client_id': data.get('client_id', ''),
+            'key': data['key'],
+            'room_id': room_id,
+            'carrier': data['carrier'],
+            'transport': data['transport'],
+            'mode': data.get('mode', 'cnc'),
+            'socks_port': data.get('socks_port', 1080 + len(users)),
+            'transport_params': data.get('transport_params', {}),
+            'debug': data.get('debug', False),
+            'profile_name': data.get('profile_name', ''),
+            'dns': data.get('dns', '1.1.1.1:53'),
+            'node_id': data.get('node_id', 'local'),
+            'state': 'stopped',
+            'container_id': None
+        }
+        save_users()
+
+    return jsonify({'success': True, 'uid': uid})
+
+@app.route('/api/users/delete/<uid>', methods=['POST'])
+@require_auth
+def delete_user(uid):
+    with lock:
+        stop_olcrtc_container(uid)
+        if uid in users:
+            del users[uid]
+            save_users()
+        if uid in logs:
+            del logs[uid]
+
+    return jsonify({'success': True})
+
+@app.route('/api/users/get/<uid>', methods=['GET'])
+@require_auth
+def get_user(uid):
+    if uid not in users:
+        return jsonify({'error': 'User not found'}), 404
+
+    user = users[uid]
+    return jsonify({
+        'client_id': user.get('client_id', ''),
+        'room_id': user.get('room_id', ''),
+        'key': user.get('key', ''),
+        'carrier': user.get('carrier', 'telemost'),
+        'transport': user.get('transport', 'datachannel'),
+        'mode': user.get('mode', 'srv'),
+        'socks_port': user.get('socks_port', 1080),
+        'transport_params': user.get('transport_params', {}),
+        'debug': user.get('debug', False),
+        'profile_name': user.get('profile_name', ''),
+        'dns': user.get('dns', '1.1.1.1:53'),
+        'node_id': user.get('node_id', 'local'),
+        'rx_limit': user.get('rx_limit', 0),
+        'tx_limit': user.get('tx_limit', 0),
+    })
+
+@app.route('/api/users/update/<uid>', methods=['POST'])
+@require_auth
+def update_user(uid):
+    if uid not in users:
+        return jsonify({'error': 'User not found'}), 404
+
+    data = request.json
+
+    with lock:
+        user = users[uid]
+
+        # Update fields
+        if data.get('key'):
+            user['key'] = data['key']
+        if data.get('room_id'):
+            user['room_id'] = data['room_id']
+        if data.get('carrier'):
+            user['carrier'] = data['carrier']
+        if data.get('transport'):
+            user['transport'] = data['transport']
+        if data.get('mode'):
+            user['mode'] = data['mode']
+        if data.get('socks_port'):
+            user['socks_port'] = data['socks_port']
+        if 'transport_params' in data:
+            user['transport_params'] = data['transport_params']
+        if 'debug' in data:
+            user['debug'] = data['debug']
+        if 'profile_name' in data:
+            user['profile_name'] = data['profile_name']
+        if data.get('dns'):
+            user['dns'] = data['dns']
+        if 'rx_limit' in data:
+            user['rx_limit'] = data['rx_limit']
+        if 'tx_limit' in data:
+            user['tx_limit'] = data['tx_limit']
+        if data.get('node_id'):
+            user['node_id'] = data['node_id']
+        if 'client_id' in data:
+            user['client_id'] = data.get('client_id') or ''
+
+        err = validate_carrier_transport_pair(user.get('carrier', ''), user.get('transport', ''))
+        if err:
+            return jsonify({'error': err}), 400
+        user['room_id'] = normalize_room_id_for_carrier(user.get('carrier', ''), user.get('room_id', ''))
+        write_olcrtc_config(uid, user)
+
+        save_users()
+
+        if user.get('state') == 'running':
+            stop_olcrtc_container(uid)
+            start_olcrtc_container(uid)
+
+    return jsonify({'success': True})
+
+@app.route('/api/users/start/<uid>', methods=['POST'])
+@require_auth
+def start_user(uid):
+    if uid not in users:
+        return jsonify({'error': 'User not found'}), 404
+
+    success = start_olcrtc_container(uid)
+    if not success:
+        return jsonify({'success': False, 'error': 'Container failed to start'}), 500
+    return jsonify({'success': True})
+
+@app.route('/api/users/stop/<uid>', methods=['POST'])
+@require_auth
+def stop_user(uid):
+    if uid not in users:
+        return jsonify({'error': 'User not found'}), 404
+
+    success = stop_olcrtc_container(uid)
+    return jsonify({'success': success})
+
+@app.route('/api/users/logs/<uid>', methods=['GET'])
+@require_auth
+def get_logs(uid):
+    with lock:
+        user = users.get(uid)
+        if not user:
+            return jsonify({'logs': []})
+
+        node_id = user.get('node_id', 'local')
+
+        # Get logs from remote node
+        if node_id != 'local':
+            try:
+                container_id = user.get('container_id')
+                if container_id:
+                    result = call_node_api(node_id, 'GET', f'/containers/{container_id}/logs')
+                    return jsonify({'logs': result.get('logs', [])})
+            except Exception as e:
+                print(f"Error getting remote logs: {e}")
+                return jsonify({'logs': [f"Error: {str(e)}"]})
+
+        # Get local logs
+        if uid in logs:
+            return jsonify({'logs': list(logs[uid])})
+        return jsonify({'logs': []})
+
+@app.route('/api/config', methods=['GET'])
+@require_auth
+def get_config():
+    config = load_config()
+    return jsonify(config)
+
+@app.route('/api/config', methods=['POST'])
+@require_auth
+def update_config():
+    config = request.json
+    save_config(config)
+    return jsonify({'success': True})
+
+@app.route('/api/generate-room-ids', methods=['POST'])
+@require_auth
+def generate_room_ids():
+    data = request.json
+    return jsonify({
+        'error': (
+            'telemost does not support automated room generation; '
+            'paste a meeting link from https://telemost.yandex.ru/ manually'
+        )
+    }), 400
+
+@app.route('/api/generate-uri/<uid>', methods=['GET'])
+@require_auth
+def generate_uri(uid):
+    if uid not in users:
+        return jsonify({'error': 'User not found'}), 404
+
+    user = users[uid]
+
+    params_str = ''
+    if user.get('transport_params'):
+        params_list = [f"{k}={v}" for k, v in user['transport_params'].items() if v]
+        if params_list:
+            params_str = '<' + '&'.join(params_list) + '>'
+
+    uri = build_olcrtc_uri(user)
+    return jsonify({
+        'uri': uri,
+        'olcbox_hint': (
+            'Universal olcrtc URI (no client-id). olcbox uses device install-id for VP8.'
+        ),
+    })
+
+@app.route('/api/users/traffic/<uid>', methods=['GET'])
+@require_auth
+def get_traffic(uid):
+    with lock:
+        user = users.get(uid)
+        if user and user.get('node_id') != 'local':
+            # Remote nodes don't support traffic monitoring yet
+            return jsonify({'rx_bytes': 0, 'tx_bytes': 0, 'rx_mb': 0, 'tx_mb': 0, 'total_mb': 0, 'rx_speed': 0, 'tx_speed': 0})
+
+        if uid in traffic_stats:
+            return jsonify(traffic_stats[uid])
+        return jsonify({'rx_bytes': 0, 'tx_bytes': 0, 'rx_mb': 0, 'tx_mb': 0, 'total_mb': 0, 'rx_speed': 0, 'tx_speed': 0})
+
+@app.route('/api/olcbox/hwid', methods=['GET'])
+def olcbox_hwid():
+    hwid = (request.headers.get('x-hwid') or request.headers.get('X-Hwid') or '').strip()
+    if hwid:
+        with open(os.path.join(DATA_DIR, 'last_hwid.txt'), 'a') as f:
+            f.write(hwid + '\n')
+        return Response('CLIENT_ID' + hwid + '\n', mimetype='text/plain')
+    return Response('no x-hwid\n', mimetype='text/plain'), 400
+
+@app.route('/api/subscription/<client_id>', methods=['GET'])
+def get_subscription(client_id):
+    """Generate subscription file for specific client_id"""
+    with lock:
+        # Find all running instances with this client_id
+        instances = []
+        for uid, user in users.items():
+            if user.get('state') != 'running':
+                continue
+            cid = user.get('client_id') or ''
+            pname = user.get('profile_name') or ''
+            if client_id not in (cid, pname, f'instance-{uid}'):
+                continue
+
+            uri = build_olcrtc_uri(user)
+
+            # Get traffic stats
+            traffic = traffic_stats.get(uid, {})
+            used_mb = traffic.get('total_mb', 0)
+
+            instances.append({
+                'uri': uri,
+                'name': user.get('profile_name') or f"Instance {uid}",
+                'used': f"{used_mb}mb",
+                'mode': user.get('mode', 'srv'),
+                'transport': user.get('transport', 'datachannel'),
+                'carrier': user.get('carrier', 'telemost')
+            })
+
+        if not instances:
+            return Response("# No running instances found for this client_id\n", mimetype='text/plain')
+
+        # Build subscription file content
+        lines = []
+        lines.append(f"#name: {client_id}")
+        lines.append(f"#update: {int(time.time())}")
+        lines.append(f"#refresh: 5m")
+        lines.append(f"#color: #22c55e")
+        lines.append("")
+
+        for instance in instances:
+            lines.append(instance['uri'])
+            lines.append(f"##name: {instance['name']}")
+            lines.append(f"##used: {instance['used']}")
+            lines.append(f"##comment: {instance['mode']} mode, {instance['transport']} transport, {instance['carrier']} carrier")
+            lines.append("")
+
+        content = '\n'.join(lines)
+        return Response(content, mimetype='text/plain')
+
+@app.route('/api/subscription/list', methods=['GET'])
+@require_auth
+def list_subscriptions():
+    """List running instances for subscription links"""
+    with lock:
+        items = []
+        for uid, user in users.items():
+            if user.get('state') != 'running':
+                continue
+            key = user.get('profile_name') or user.get('client_id') or f'instance-{uid}'
+            items.append({
+                'uid': uid,
+                'key': key,
+                'profile_name': user.get('profile_name', ''),
+                'client_id': user.get('client_id', ''),
+            })
+        return jsonify({'instances': items, 'client_ids': sorted({i['key'] for i in items})})
+
+@app.route('/api/nodes', methods=['GET'])
+@require_auth
+def get_nodes():
+    """Get all nodes"""
+    with lock:
+        return jsonify({'nodes': list(nodes.values())})
+
+@app.route('/api/nodes', methods=['POST'])
+@require_auth
+def add_node():
+    """Add a new node"""
+    data = request.json
+    node_id = str(len(nodes) + 1)
+
+    # Generate random token if not provided
+    import secrets
+    token = data.get('token') or secrets.token_urlsafe(32)
+
+    node = {
+        'id': node_id,
+        'name': data.get('name'),
+        'host': data.get('host'),
+        'port': data.get('port', 3002),
+        'token': token,
+        'status': 'unknown',
+        'created_at': time.time()
+    }
+
+    # Generate docker-compose.yml for the node with embedded Python code
+    compose_content = f"""version: '3.8'
+
+services:
+  olcpanel-node:
+    image: python:3.11-slim
+    container_name: olcpanel-node
+    restart: unless-stopped
+    ports:
+      - "{node['port']}:3002"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - NODE_TOKEN={token}
+      - PYTHONUNBUFFERED=1
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        pip install --no-cache-dir flask docker psutil
+        cat > /app/node_api.py << 'EOF'
+        import os
+import re
+import yaml
+        import json
+        import docker
+        from flask import Flask, jsonify, request
+        from functools import wraps
+
+        app = Flask(__name__)
+        docker_client = docker.DockerClient(base_url="unix://var/run/docker.sock")
+
+        NODE_TOKEN = os.environ.get("NODE_TOKEN", "change-me")
+
+        def require_token(f):
+            @wraps(f)
+            def decorated(*args, **kwargs):
+                token = request.headers.get("X-Node-Token")
+                if not token or token != NODE_TOKEN:
+                    return jsonify({{"error": "Unauthorized"}}), 401
+                return f(*args, **kwargs)
+            return decorated
+
+        @app.route("/health", methods=["GET"])
+        def health():
+            return jsonify({{"status": "ok", "docker": docker_client.ping()}})
+
+        @app.route("/containers", methods=["GET"])
+        @require_token
+        def list_containers():
+            try:
+                containers = docker_client.containers.list(all=True, filters={{"name": "olcrtc-"}})
+                result = []
+                for container in containers:
+                    result.append({{
+                        "id": container.id[:12],
+                        "name": container.name,
+                        "status": container.status,
+                        "image": container.image.tags[0] if container.image.tags else "unknown"
+                    }})
+                return jsonify({{"containers": result}})
+            except Exception as e:
+                return jsonify({{"error": str(e)}}), 500
+
+        @app.route("/containers/start", methods=["POST"])
+        @require_token
+        def start_container():
+            try:
+                data = request.json
+                container = docker_client.containers.run(
+                    data.get("image", "olcrtc:latest"),
+                    command=data.get("command", []),
+                    detach=True,
+                    name=data.get("name"),
+                    ports=data.get("ports", {{}}),
+                    environment=data.get("environment", {{}}),
+                    remove=False,
+                    network_mode=data.get("network_mode", "bridge")
+                )
+                return jsonify({{"container_id": container.id, "status": "started"}})
+            except Exception as e:
+                return jsonify({{"error": str(e)}}), 500
+
+        @app.route("/containers/<container_id>/stop", methods=["POST"])
+        @require_token
+        def stop_container(container_id):
+            try:
+                container = docker_client.containers.get(container_id)
+                container.stop(timeout=5)
+                container.remove()
+                return jsonify({{"status": "stopped"}})
+            except Exception as e:
+                return jsonify({{"error": str(e)}}), 500
+
+        @app.route("/containers/<container_id>/logs", methods=["GET"])
+        @require_token
+        def get_container_logs(container_id):
+            try:
+                container = docker_client.containers.get(container_id)
+                logs = container.logs(tail=1000).decode("utf-8", errors="ignore")
+                return jsonify({{"logs": logs.split("\\n")}})
+            except Exception as e:
+                return jsonify({{"error": str(e)}}), 500
+
+        @app.route("/stats", methods=["GET"])
+        @require_token
+        def get_stats():
+            try:
+                import psutil
+                return jsonify({{
+                    "cpu_percent": psutil.cpu_percent(interval=1),
+                    "memory_percent": psutil.virtual_memory().percent,
+                    "disk_percent": psutil.disk_usage("/").percent
+                }})
+            except Exception as e:
+                return jsonify({{"error": str(e)}}), 500
+
+        if __name__ == "__main__":
+            app.run(host="0.0.0.0", port=3002, debug=False)
+        EOF
+        mkdir -p /app
+        python /app/node_api.py
+    working_dir: /app
+"""
+
+    node['docker_compose'] = compose_content
+
+    with lock:
+        nodes[node_id] = node
+        save_nodes()
+
+    return jsonify({
+        'success': True,
+        'node': node,
+        'docker_compose': compose_content,
+        'instructions': f"""
+Инструкция по установке ноды:
+
+1. Создайте директорию на сервере:
+   mkdir -p /opt/olcpanel-node && cd /opt/olcpanel-node
+
+2. Создайте файл docker-compose.yml с содержимым выше
+
+3. Запустите ноду:
+   docker compose up -d
+
+4. Проверьте статус:
+   docker compose logs -f
+
+Нода будет доступна на порту {node['port']}
+"""
+    })
+
+@app.route('/api/nodes/<node_id>', methods=['DELETE'])
+@require_auth
+def delete_node(node_id):
+    """Delete a node"""
+    with lock:
+        if node_id in nodes:
+            del nodes[node_id]
+            save_nodes()
+            return jsonify({'success': True})
+        return jsonify({'error': 'Node not found'}), 404
+
+@app.route('/api/nodes/<node_id>/health', methods=['GET'])
+@require_auth
+def check_node_health(node_id):
+    """Check node health"""
+    if node_id not in nodes:
+        return jsonify({'error': 'Node not found'}), 404
+
+    node = nodes[node_id]
+    try:
+        import requests
+        response = requests.get(
+            f"http://{node['host']}:{node['port']}/health",
+            timeout=5
+        )
+        return jsonify(response.json())
+    except Exception as e:
+        return jsonify({'error': str(e), 'status': 'offline'}), 500
+
+if __name__ == '__main__':
+    load_users()
+    load_nodes()
+
+    # Start node monitoring thread
+    monitor_thread = threading.Thread(target=monitor_nodes, daemon=True)
+    monitor_thread.start()
+
+    # Start memory monitoring thread
+    memory_thread = threading.Thread(target=monitor_memory, daemon=True)
+    memory_thread.start()
+
+    app.run(host='0.0.0.0', port=3001, debug=False)

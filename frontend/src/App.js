@@ -1,0 +1,1930 @@
+import React, { useState, useEffect } from 'react';
+import axios from 'axios';
+import QRCode from 'qrcode';
+import {
+  Play,
+  Square,
+  Edit,
+  Trash2,
+  Copy,
+  Plus,
+  Dice5,
+  LogOut,
+  Server,
+  Cpu,
+  Activity,
+  Terminal,
+  X,
+  QrCode as QrCodeIcon,
+  Settings
+} from 'lucide-react';
+import { Button } from './components/ui/button';
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from './components/ui/card';
+import { Input } from './components/ui/input';
+import { Label } from './components/ui/label';
+import { Select } from './components/ui/select';
+import { Badge } from './components/ui/badge';
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from './components/ui/dialog';
+
+function App() {
+  // All existing state from original App.js
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [loginData, setLoginData] = useState({ username: '', password: '' });
+  const [loginError, setLoginError] = useState('');
+  const [users, setUsers] = useState([]);
+  const [serverStats, setServerStats] = useState({ cpu_percent: 0, mem_percent: 0 });
+  const [selectedUser, setSelectedUser] = useState(null);
+  const [logs, setLogs] = useState([]);
+  const [autoRefresh, setAutoRefresh] = useState(true);
+  const [showAddForm, setShowAddForm] = useState(false);
+  const [showGenForm, setShowGenForm] = useState(false);
+  const [showEditForm, setShowEditForm] = useState(false);
+  const [editingUser, setEditingUser] = useState(null);
+  const [showQrDialog, setShowQrDialog] = useState(false);
+  const [qrCodeData, setQrCodeData] = useState(null);
+  const [trafficStats, setTrafficStats] = useState({});
+  const [showSubscriptionDialog, setShowSubscriptionDialog] = useState(false);
+  const [subscriptionUrls, setSubscriptionUrls] = useState([]);
+  const [collapsedGroups, setCollapsedGroups] = useState({});
+  const [activeTab, setActiveTab] = useState('instances'); // 'instances' or 'nodes'
+  const [nodes, setNodes] = useState([]);
+  const [showAddNodeDialog, setShowAddNodeDialog] = useState(false);
+  const [selectedNode, setSelectedNode] = useState(null);
+  const [newNode, setNewNode] = useState({
+    name: '',
+    host: '',
+    port: 3002,
+    token: ''
+  });
+  const [nodeSetupData, setNodeSetupData] = useState(null);
+  const [showNodeSetupDialog, setShowNodeSetupDialog] = useState(false);
+  const [genConfig, setGenConfig] = useState({
+    carrier: 'telemost',
+    amount: 1,
+    dns: '1.1.1.1:53'
+  });
+  const [generatedRooms, setGeneratedRooms] = useState(() => {
+    const saved = localStorage.getItem('generatedRooms');
+    return saved ? JSON.parse(saved) : [];
+  });
+  const [isGenerating, setIsGenerating] = useState(false);
+  const [showRoomIdPicker, setShowRoomIdPicker] = useState(false);
+  const [roomIdPickerTarget, setRoomIdPickerTarget] = useState(null); // 'new' or 'edit'
+  const [showSettingsDialog, setShowSettingsDialog] = useState(false);
+  const [settingsTab, setSettingsTab] = useState('security');
+  const [settingsForm, setSettingsForm] = useState({
+    username: '',
+    password: '',
+    newPassword: '',
+    dns: '1.1.1.1:53',
+    debug: false
+  });
+  const [notifications, setNotifications] = useState([]);
+  const [carriers, setCarriers] = useState([]);
+  const [transports, setTransports] = useState([]);
+  const [transportParams, setTransportParams] = useState([]);
+  const [newUser, setNewUser] = useState({
+    client_id: '',
+    key: '',
+    room_id: '',
+    carrier: 'telemost',
+    transport: 'vp8channel',
+    mode: 'srv',
+    socks_port: '',
+    transport_params: {},
+    debug: false,
+    profile_name: '',
+    dns: '1.1.1.1:53',
+    rx_limit: 0,
+    tx_limit: 0
+  });
+
+  // Copy all useEffect hooks and functions from original
+  useEffect(() => {
+    const token = localStorage.getItem('auth_token');
+    if (token) {
+      axios.defaults.headers.common['Authorization'] = `Bearer ${token}`;
+      setIsAuthenticated(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (isAuthenticated) {
+      fetchConfig();
+      fetchCarriers();
+      fetchStatus();
+      fetchNodes();
+      const interval = setInterval(() => {
+        if (autoRefresh) {
+          fetchStatus();
+          if (selectedUser) {
+            fetchLogs(selectedUser);
+          }
+        }
+      }, 2000);
+      return () => clearInterval(interval);
+    }
+  }, [autoRefresh, selectedUser, isAuthenticated]);
+
+  // Separate effect for traffic stats that depends on users
+  useEffect(() => {
+    if (isAuthenticated && users.length > 0) {
+      fetchTrafficStats();
+      const interval = setInterval(() => {
+        if (autoRefresh) {
+          fetchTrafficStats();
+        }
+      }, 2000);
+      return () => clearInterval(interval);
+    }
+  }, [isAuthenticated, autoRefresh, users.length]);
+
+  useEffect(() => {
+    if (newUser.transport && isAuthenticated) {
+      fetchTransportParams(newUser.transport);
+    }
+  }, [newUser.transport, isAuthenticated]);
+
+  useEffect(() => {
+    if (isAuthenticated && newUser.carrier) {
+      fetchTransports(newUser.carrier);
+    }
+  }, [newUser.carrier, isAuthenticated]);
+
+  useEffect(() => {
+    if (!isAuthenticated || !transports.length) return;
+    if (!transports.includes(newUser.transport)) {
+      const t = transports[0];
+      setNewUser(prev => ({ ...prev, transport: t, transport_params: {} }));
+      fetchTransportParams(t);
+    }
+  }, [transports, isAuthenticated, newUser.transport]);
+
+  const fetchConfig = async () => {
+    try {
+      const response = await axios.get('/api/config');
+      const config = response.data;
+      const defaultDns = config.dns || '1.1.1.1:53';
+      // Set default DNS from server config for new instances
+      setNewUser(prev => ({ ...prev, dns: defaultDns }));
+      // Pre-fill settings form with all config values
+      setSettingsForm(prev => ({
+        ...prev,
+        username: config.username || '',
+        dns: defaultDns,
+        debug: config.debug || false
+      }));
+    } catch (err) {
+      console.error('Failed to fetch config:', err);
+    }
+  };
+
+  const handleLogin = async (e) => {
+    e.preventDefault();
+    try {
+      const response = await axios.post('/api/login', loginData);
+      const token = response.data.token;
+      localStorage.setItem('auth_token', token);
+      axios.defaults.headers.common['Authorization'] = `Bearer ${token}`;
+      setIsAuthenticated(true);
+      setLoginError('');
+    } catch (err) {
+      setLoginError('Неверный логин или пароль');
+    }
+  };
+
+  const handleLogout = () => {
+    localStorage.removeItem('auth_token');
+    delete axios.defaults.headers.common['Authorization'];
+    setIsAuthenticated(false);
+    setLoginData({ username: '', password: '' });
+  };
+
+  const fetchCarriers = async () => {
+    try {
+      const response = await axios.get('/api/carriers');
+      setCarriers(response.data.carriers);
+    } catch (err) {
+      if (err.response?.status === 401) handleLogout();
+    }
+  };
+
+  const fetchTransports = async (carrier = 'telemost') => {
+    try {
+      const response = await axios.get(`/api/transports-for/${encodeURIComponent(carrier)}`);
+      const list = response.data.transports;
+      setTransports(list);
+      return list;
+    } catch (err) {
+      console.error('Failed to fetch transports:', err);
+      return null;
+    }
+  };
+
+  const fetchTransportParams = async (transport) => {
+    try {
+      const response = await axios.get(`/api/transport-params/${transport}`);
+      setTransportParams(response.data.params);
+      const defaultParams = {};
+      response.data.params.forEach(param => {
+        defaultParams[param.name] = param.default;
+      });
+      setNewUser(prev => ({ ...prev, transport_params: defaultParams }));
+    } catch (err) {
+      console.error('Failed to fetch transport params:', err);
+    }
+  };
+
+  const fetchStatus = async () => {
+    try {
+      const response = await axios.get('/api/status');
+      setUsers(response.data.users);
+      setServerStats(response.data.server);
+
+      // Initialize collapsed groups - all collapsed by default
+      const initialCollapsed = {};
+      response.data.users.forEach(user => {
+        const clientId = user.client_id || 'unknown';
+        if (!(clientId in initialCollapsed)) {
+          initialCollapsed[clientId] = true;
+        }
+      });
+      setCollapsedGroups(prev => ({ ...initialCollapsed, ...prev }));
+    } catch (err) {
+      if (err.response?.status === 401) handleLogout();
+    }
+  };
+
+  const fetchLogs = async (uid) => {
+    try {
+      const response = await axios.get(`/api/users/logs/${uid}`);
+      setLogs(response.data.logs);
+    } catch (err) {
+      console.error('Failed to fetch logs:', err);
+    }
+  };
+
+  const fetchTrafficStats = async () => {
+    try {
+      const stats = {};
+      for (const user of users) {
+        if (user.state === 'running' && user.mode === 'srv') {
+          const response = await axios.get(`/api/users/traffic/${user.id}`);
+          stats[user.id] = response.data;
+        }
+      }
+      setTrafficStats(stats);
+    } catch (err) {
+      console.error('Failed to fetch traffic stats:', err);
+    }
+  };
+
+  const fetchNodes = async () => {
+    try {
+      const response = await axios.get('/api/nodes');
+      setNodes(response.data.nodes);
+    } catch (err) {
+      console.error('Failed to fetch nodes:', err);
+    }
+  };
+
+  const addNode = async () => {
+    if (!newNode.name || !newNode.host) {
+      showNotification('Заполни название и host!', 'error');
+      return;
+    }
+    try {
+      const response = await axios.post('/api/nodes', newNode);
+      setShowAddNodeDialog(false);
+      setNewNode({ name: '', host: '', port: 3002, token: '' });
+      setNodeSetupData(response.data);
+      setShowNodeSetupDialog(true);
+      fetchNodes();
+      showNotification('Нода добавлена');
+    } catch (err) {
+      showNotification('Ошибка добавления ноды', 'error');
+    }
+  };
+
+  const deleteNode = async (nodeId) => {
+    if (!window.confirm('Удалить ноду?')) return;
+    try {
+      await axios.delete(`/api/nodes/${nodeId}`);
+      fetchNodes();
+      showNotification('Нода удалена');
+    } catch (err) {
+      showNotification('Ошибка удаления ноды', 'error');
+    }
+  };
+
+  const checkNodeHealth = async (nodeId) => {
+    try {
+      const response = await axios.get(`/api/nodes/${nodeId}/health`);
+      return response.data.status === 'ok' ? 'online' : 'offline';
+    } catch (err) {
+      return 'offline';
+    }
+  };
+
+  const saveSecuritySettings = async () => {
+    if (!settingsForm.username || !settingsForm.password) {
+      showNotification('Заполните логин и текущий пароль!', 'error');
+      return;
+    }
+    try {
+      await axios.post('/api/config', {
+        username: settingsForm.username,
+        password: settingsForm.newPassword || settingsForm.password,
+        dns: settingsForm.dns || '1.1.1.1:53',
+        debug: settingsForm.debug
+      });
+      setSettingsForm(prev => ({ ...prev, password: '', newPassword: '' }));
+      showNotification('Логин и пароль сохранены');
+    } catch (err) {
+      showNotification('Ошибка сохранения', 'error');
+    }
+  };
+
+  const saveCoreSettings = async () => {
+    if (!settingsForm.dns) {
+      showNotification('Введите DNS сервер!', 'error');
+      return;
+    }
+    try {
+      await axios.post('/api/config', {
+        username: settingsForm.username,
+        password: settingsForm.newPassword || settingsForm.password,
+        dns: settingsForm.dns,
+        debug: settingsForm.debug
+      });
+      setNewUser(prev => ({ ...prev, dns: settingsForm.dns }));
+      showNotification('DNS сохранён');
+    } catch (err) {
+      showNotification('Ошибка сохранения', 'error');
+    }
+  };
+
+  const saveDevSettings = async () => {
+    try {
+      await axios.post('/api/config', {
+        username: settingsForm.username,
+        password: settingsForm.newPassword || settingsForm.password,
+        dns: settingsForm.dns || '1.1.1.1:53',
+        debug: settingsForm.debug
+      });
+      showNotification(`Debug режим ${settingsForm.debug ? 'включён' : 'выключён'}`);
+    } catch (err) {
+      showNotification('Ошибка сохранения', 'error');
+    }
+  };
+
+  const generateKey = () => {
+    const chars = '0123456789abcdef';
+    let key = '';
+    for (let i = 0; i < 64; i++) {
+      key += chars[Math.floor(Math.random() * chars.length)];
+    }
+    setNewUser({ ...newUser, key });
+  };
+
+  const showNotification = (message, type = 'success') => {
+    const id = Date.now();
+    setNotifications(prev => [...prev, { id, message, type }]);
+    setTimeout(() => {
+      setNotifications(prev => prev.filter(n => n.id !== id));
+    }, 3000);
+  };
+
+  const generateRoomIds = async () => {
+    setIsGenerating(true);
+    try {
+      const response = await axios.post('/api/generate-room-ids', genConfig);
+      const newRooms = response.data.room_ids;
+      const updatedRooms = [...generatedRooms, ...newRooms];
+      setGeneratedRooms(updatedRooms);
+      localStorage.setItem('generatedRooms', JSON.stringify(updatedRooms));
+      showNotification(`Сгенерировано ${newRooms.length} Room ID`);
+    } catch (err) {
+      const message = err.response?.data?.error || err.message || 'Ошибка генерации Room ID';
+      showNotification(message, 'error');
+    } finally {
+      setIsGenerating(false);
+    }
+  };
+
+  const removeRoomId = (index) => {
+    const updatedRooms = generatedRooms.filter((_, i) => i !== index);
+    setGeneratedRooms(updatedRooms);
+    localStorage.setItem('generatedRooms', JSON.stringify(updatedRooms));
+    showNotification('Room ID удалён');
+  };
+
+  const selectRoomId = (roomId) => {
+    if (roomIdPickerTarget === 'new') {
+      setNewUser({ ...newUser, room_id: roomId });
+    } else if (roomIdPickerTarget === 'edit') {
+      setEditingUser({ ...editingUser, room_id: roomId });
+    }
+    setShowRoomIdPicker(false);
+    showNotification('Room ID выбран');
+  };
+
+  const openRoomIdPicker = (target) => {
+    setRoomIdPickerTarget(target);
+    setShowRoomIdPicker(true);
+  };
+
+  const copyToClipboard = async (text, label = 'Текст') => {
+    try {
+      if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+        await navigator.clipboard.writeText(text);
+        showNotification(`${label} скопирован!`);
+      } else {
+        const textArea = document.createElement('textarea');
+        textArea.value = text;
+        textArea.style.position = 'fixed';
+        textArea.style.left = '-999999px';
+        document.body.appendChild(textArea);
+        textArea.select();
+        document.execCommand('copy');
+        document.body.removeChild(textArea);
+        showNotification(`${label} скопирован!`);
+      }
+    } catch (err) {
+      showNotification(`Ошибка копирования: ${err.message}`, 'error');
+    }
+  };
+
+  const addUser = async () => {
+    if (!newUser.key || !newUser.room_id) {
+      showNotification('Заполни Key и Room ID!', 'error');
+      return;
+    }
+    try {
+      const currentDns = newUser.dns;
+      await axios.post('/api/users/add', newUser);
+      setNewUser({
+        client_id: '',
+        key: '',
+        room_id: '',
+        carrier: 'telemost',
+        transport: 'vp8channel',
+        mode: 'srv',
+        socks_port: '',
+        transport_params: {},
+        debug: false,
+        profile_name: '',
+        dns: currentDns
+      });
+      setShowAddForm(false);
+      fetchStatus();
+      showNotification('Инстанс создан');
+    } catch (err) {
+      showNotification('Ошибка добавления', 'error');
+    }
+  };
+
+
+  const deleteUser = async (uid) => {
+    if (!window.confirm('Точно удалить?')) return;
+    try {
+      await axios.post(`/api/users/delete/${uid}`);
+      if (selectedUser === uid) {
+        setSelectedUser(null);
+        setLogs([]);
+      }
+      fetchStatus();
+      showNotification('Инстанс удалён');
+    } catch (err) {
+      showNotification('Ошибка удаления', 'error');
+    }
+  };
+
+  const editUser = async (user) => {
+    try {
+      const response = await axios.get(`/api/users/get/${user.id}`);
+      const userData = response.data;
+      const carrier = userData.carrier || 'telemost';
+      const allowed = await fetchTransports(carrier) || [];
+      let transport = userData.transport || 'datachannel';
+      if (!allowed.includes(transport)) {
+        transport = allowed[0] || 'vp8channel';
+      }
+      setEditingUser({
+        id: user.id,
+        client_id: userData.client_id || '',
+        key: userData.key || '',
+        room_id: userData.room_id || '',
+        carrier,
+        transport,
+        mode: userData.mode || 'srv',
+        socks_port: userData.socks_port || 1080,
+        transport_params: userData.transport_params || {},
+        debug: userData.debug || false,
+        profile_name: userData.profile_name || '',
+        dns: userData.dns || '1.1.1.1:53',
+        node_id: userData.node_id || 'local',
+        rx_limit: userData.rx_limit || 0,
+        tx_limit: userData.tx_limit || 0,
+      });
+      setShowEditForm(true);
+      fetchTransportParams(transport);
+    } catch (err) {
+      showNotification('Ошибка загрузки данных', 'error');
+    }
+  };
+
+
+  const updateUser = async () => {
+    try {
+      await axios.post(`/api/users/update/${editingUser.id}`, editingUser);
+      setEditingUser(null);
+      setShowEditForm(false);
+      fetchStatus();
+      showNotification('Инстанс обновлён');
+    } catch (err) {
+      const msg = err.response?.data?.error || err.message || 'Ошибка обновления';
+      showNotification(msg, 'error');
+    }
+  };
+
+  const startUser = async (uid) => {
+    try {
+      await axios.post(`/api/users/start/${uid}`);
+      fetchStatus();
+    } catch (err) {
+      const msg = err.response?.data?.error || 'Ошибка запуска'; showNotification(msg, 'error');
+    }
+  };
+
+  const stopUser = async (uid) => {
+    try {
+      await axios.post(`/api/users/stop/${uid}`);
+      fetchStatus();
+    } catch (err) {
+      showNotification('Ошибка остановки', 'error');
+    }
+  };
+
+  const selectUser = (uid) => {
+    setSelectedUser(uid);
+    fetchLogs(uid);
+  };
+
+  const generateUri = async (uid) => {
+    try {
+      const response = await axios.get(`/api/generate-uri/${uid}`);
+      const { uri, binding_token: bt } = response.data;
+      await copyToClipboard(uri, 'URI');
+      if (bt) {
+        showNotification(`URI copied. В логах srv: want=${bt}`, 'info');
+      }
+    } catch (err) {
+      showNotification('Ошибка генерации URI', 'error');
+    }
+  };
+
+  const generateQrCode = async (uid) => {
+    try {
+      const response = await axios.get(`/api/generate-uri/${uid}`);
+      const uri = response.data.uri;
+
+      // Generate QR code as data URL
+      const qrDataUrl = await QRCode.toDataURL(uri, {
+        width: 512,
+        margin: 2,
+        color: {
+          dark: '#000000',
+          light: '#FFFFFF'
+        }
+      });
+
+      const user = users.find(u => u.id === uid);
+      setQrCodeData({
+        uri,
+        qrImage: qrDataUrl,
+        instanceId: uid,
+        clientId: user?.client_id || 'Unknown'
+      });
+      setShowQrDialog(true);
+    } catch (err) {
+      showNotification('Ошибка генерации QR кода', 'error');
+    }
+  };
+
+  const downloadQrCode = () => {
+    if (!qrCodeData) return;
+
+    const link = document.createElement('a');
+    link.download = `olcrtc-qr-${qrCodeData.instanceId}.png`;
+    link.href = qrCodeData.qrImage;
+    link.click();
+    showNotification('QR код скачан');
+  };
+
+  // Login screen
+  if (!isAuthenticated) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-black">
+        <Card className="w-full max-w-md">
+          <CardHeader className="space-y-1">
+            <CardTitle className="text-3xl font-bold text-center">OlcPanel</CardTitle>
+            <CardDescription className="text-center">
+              Управление OlcRTC инстансами
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <form onSubmit={handleLogin} className="space-y-4">
+              <div className="space-y-2">
+                <Label htmlFor="username">Логин</Label>
+                <Input
+                  id="username"
+                  type="text"
+                  placeholder="admin"
+                  value={loginData.username}
+                  onChange={(e) => setLoginData({ ...loginData, username: e.target.value })}
+                  autoFocus
+                />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="password">Пароль</Label>
+                <Input
+                  id="password"
+                  type="password"
+                  placeholder="••••••••"
+                  value={loginData.password}
+                  onChange={(e) => setLoginData({ ...loginData, password: e.target.value })}
+                />
+              </div>
+              {loginError && (
+                <div className="text-sm text-destructive bg-destructive/10 p-3 rounded-md">
+                  {loginError}
+                </div>
+              )}
+              <Button type="submit" className="w-full">
+                Войти
+              </Button>
+            </form>
+          </CardContent>
+        </Card>
+      </div>
+    );
+  }
+
+  // Main dashboard
+  return (
+    <div className="min-h-screen bg-background">
+      {/* Header */}
+      <header className="border-b">
+        <div className="container mx-auto px-4 py-4 flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <Server className="h-6 w-6" />
+            <h1 className="text-2xl font-bold">OlcPanel</h1>
+          </div>
+          <div className="flex items-center gap-4">
+            <div className="flex items-center gap-3 text-sm">
+              <div className="flex items-center gap-1">
+                <Cpu className="h-4 w-4" />
+                <span>CPU: {serverStats.cpu_percent.toFixed(1)}%</span>
+              </div>
+              <div className="flex items-center gap-1">
+                <Activity className="h-4 w-4" />
+                <span>RAM: {serverStats.mem_percent.toFixed(1)}%</span>
+              </div>
+            </div>
+            <label className="flex items-center gap-2 text-sm cursor-pointer">
+              <input
+                type="checkbox"
+                checked={autoRefresh}
+                onChange={(e) => setAutoRefresh(e.target.checked)}
+                className="rounded"
+              />
+              Auto-refresh
+            </label>
+            <Button variant="outline" size="sm" onClick={() => setShowSettingsDialog(true)}>
+              <Settings className="h-4 w-4 mr-2" />
+              Настройки
+            </Button>
+            <Button variant="outline" size="sm" onClick={handleLogout}>
+              <LogOut className="h-4 w-4 mr-2" />
+              Выход
+            </Button>
+          </div>
+        </div>
+      </header>
+
+      {/* Main content */}
+      <div className="container mx-auto px-4 py-6">
+        {/* Tabs */}
+        <div className="flex gap-2 mb-6">
+          <Button
+            onClick={() => setActiveTab('instances')}
+            variant={activeTab === 'instances' ? 'default' : 'outline'}
+            className="flex-1"
+          >
+            Инстансы
+          </Button>
+          <Button
+            onClick={() => setActiveTab('nodes')}
+            variant={activeTab === 'nodes' ? 'default' : 'outline'}
+            className="flex-1"
+          >
+            Ноды
+          </Button>
+        </div>
+
+        {activeTab === 'instances' && (
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+          {/* Left panel - Instances */}
+          <div className="lg:col-span-1 space-y-4">
+            <div className="flex gap-2">
+              <Button onClick={() => setShowAddForm(true)} className="flex-1">
+                <Plus className="h-4 w-4 mr-2" />
+                Добавить
+              </Button>
+            </div>
+            <div className="flex gap-2">
+              <Button
+                onClick={async () => {
+                  try {
+                    const response = await axios.get('/api/subscription/list');
+                    const clientIds = response.data.client_ids;
+                    if (clientIds.length === 0) {
+                      showNotification('Нет запущенных инстансов', 'error');
+                      return;
+                    }
+                    const urls = clientIds.map(id => ({
+                      clientId: id,
+                      url: `${window.location.origin}/api/subscription/${id}`
+                    }));
+                    setSubscriptionUrls(urls);
+                    setShowSubscriptionDialog(true);
+                  } catch (err) {
+                    showNotification('Ошибка получения subscription URLs', 'error');
+                  }
+                }}
+                variant="secondary"
+                className="flex-1"
+              >
+                <Copy className="h-4 w-4 mr-2" />
+                Subscription URL
+              </Button>
+            </div>
+
+            <Card>
+              <CardHeader>
+                <CardTitle className="text-lg">Инстансы ({users.length})</CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-2 max-h-[calc(100vh-20rem)] overflow-y-auto">
+                {users.length === 0 ? (
+                  <p className="text-sm text-muted-foreground text-center py-8">
+                    Нет инстансов
+                  </p>
+                ) : (
+                  (() => {
+                    // Group users by client_id
+                    const grouped = users.reduce((acc, user) => {
+                      const clientId = user.client_id || 'unknown';
+                      if (!acc[clientId]) acc[clientId] = [];
+                      acc[clientId].push(user);
+                      return acc;
+                    }, {});
+
+                    return Object.entries(grouped).map(([clientId, groupUsers]) => (
+                      <div key={clientId} className="space-y-2">
+                        {/* Group Header */}
+                        <div
+                          className="flex items-center justify-between p-2 bg-muted rounded hover:bg-muted/80"
+                        >
+                          <div
+                            className="flex items-center gap-2 flex-1 cursor-pointer"
+                            onClick={() => setCollapsedGroups(prev => ({
+                              ...prev,
+                              [clientId]: !prev[clientId]
+                            }))}
+                          >
+                            <span className="text-sm font-semibold">{clientId}</span>
+                            <Badge variant="outline">{groupUsers.length}</Badge>
+                            <span className="text-xs ml-auto">
+                              {collapsedGroups[clientId] ? '▶' : '▼'}
+                            </span>
+                          </div>
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              const url = `${window.location.origin}/api/subscription/${clientId}`;
+                              navigator.clipboard.writeText(url);
+                              showNotification(`Subscription URL для ${clientId} скопирован`);
+                            }}
+                            className="ml-2"
+                          >
+                            <Copy className="h-3 w-3" />
+                          </Button>
+                        </div>
+
+                        {/* Group Items */}
+                        {!collapsedGroups[clientId] && groupUsers.map(user => (
+                          <Card
+                            key={user.id}
+                            className={`cursor-pointer transition-colors ml-4 ${
+                              selectedUser === user.id ? 'border-primary' : ''
+                            }`}
+                            onClick={() => selectUser(user.id)}
+                          >
+                            <CardContent className="p-4">
+                              <div className="flex items-start justify-between mb-2">
+                                <span className="font-mono text-sm">#{user.id}</span>
+                                <Badge variant={user.state === 'running' ? 'success' : 'secondary'}>
+                                  {user.state === 'running' ? 'Running' : 'Stopped'}
+                                </Badge>
+                              </div>
+                              <div className="space-y-1 text-sm mb-3">
+                                <div><span className="text-muted-foreground">Node:</span> {user.node_id === 'local' ? 'Local' : nodes.find(n => n.id === user.node_id)?.name || user.node_id}</div>
+                                <div><span className="text-muted-foreground">Carrier:</span> {user.carrier}</div>
+                                <div><span className="text-muted-foreground">Transport:</span> {user.transport}</div>
+                                {user.mode === 'cnc' && (
+                                  <div><span className="text-muted-foreground">SOCKS:</span> :{user.socks_port}</div>
+                                )}
+                                {user.mode === 'srv' && user.socks_port && (
+                                  <div><span className="text-muted-foreground">SOCKS:</span> :{user.socks_port}</div>
+                                )}
+                                {user.state === 'running' && user.memory_mb && user.memory_mb > 0 && (
+                                  <div className="text-xs text-blue-500">
+                                    <span className="text-muted-foreground">Memory:</span> {user.memory_mb} MB
+                                  </div>
+                                )}
+                                {user.state === 'running' && user.mode === 'srv' && trafficStats[user.id] && (
+                                  <>
+                                    <div className="text-xs text-primary">
+                                      <span className="text-muted-foreground">Traffic:</span> ↓{trafficStats[user.id].rx_mb} MB / ↑{trafficStats[user.id].tx_mb} MB
+                                    </div>
+                                    <div className="text-xs text-green-500">
+                                      <span className="text-muted-foreground">Speed:</span> ↓{trafficStats[user.id].rx_speed} KB/s / ↑{trafficStats[user.id].tx_speed} KB/s
+                                    </div>
+                                  </>
+                                )}
+                              </div>
+                              <div className="flex gap-1">
+                                {user.state === 'running' ? (
+                                  <Button
+                                    size="sm"
+                                    variant="destructive"
+                                    onClick={(e) => { e.stopPropagation(); stopUser(user.id); }}
+                                    className="flex-1"
+                                  >
+                                    <Square className="h-3 w-3 mr-1" />
+                                    Stop
+                                  </Button>
+                                ) : (
+                                  <Button
+                                    size="sm"
+                                    onClick={(e) => { e.stopPropagation(); startUser(user.id); }}
+                                    className="flex-1"
+                                  >
+                                    <Play className="h-3 w-3 mr-1" />
+                                    Start
+                                  </Button>
+                                )}
+                                <Button
+                                  size="sm"
+                                  variant="outline"
+                                  onClick={(e) => { e.stopPropagation(); editUser(user); }}
+                                >
+                                  <Edit className="h-3 w-3" />
+                                </Button>
+                                <Button
+                                  size="sm"
+                                  variant="outline"
+                                  onClick={(e) => { e.stopPropagation(); generateQrCode(user.id); }}
+                                >
+                                  <QrCodeIcon className="h-3 w-3" />
+                                </Button>
+                                <Button
+                                  size="sm"
+                                  variant="outline"
+                                  onClick={(e) => { e.stopPropagation(); deleteUser(user.id); }}
+                                >
+                                  <Trash2 className="h-3 w-3" />
+                                </Button>
+                              </div>
+                            </CardContent>
+                          </Card>
+                        ))}
+                      </div>
+                    ));
+                  })()
+                )}
+              </CardContent>
+            </Card>
+          </div>
+
+          {/* Right panel - Logs */}
+          <div className="lg:col-span-2">
+            <Card className="h-[calc(100vh-12rem)]">
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2">
+                  <Terminal className="h-5 w-5" />
+                  {selectedUser ? `Логи инстанса #${selectedUser}` : 'Логи'}
+                </CardTitle>
+              </CardHeader>
+              <CardContent>
+                {selectedUser ? (
+                  <div className="bg-black text-green-400 p-4 rounded-md font-mono text-sm h-[calc(100vh-18rem)] overflow-y-auto">
+                    {logs.length === 0 ? (
+                      <div className="text-gray-500">Логов нет</div>
+                    ) : (
+                      logs.map((log, idx) => (
+                        <div key={idx}>{log}</div>
+                      ))
+                    )}
+                  </div>
+                ) : (
+                  <div className="flex flex-col items-center justify-center h-[calc(100vh-18rem)] text-muted-foreground">
+                    <Terminal className="h-12 w-12 mb-4" />
+                    <p>Выберите инстанс для просмотра логов</p>
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+          </div>
+        </div>
+        )}
+
+        {activeTab === 'nodes' && (
+        <div className="space-y-4">
+          <div className="flex justify-end">
+            <Button onClick={() => setShowAddNodeDialog(true)}>
+              <Plus className="h-4 w-4 mr-2" />
+              Добавить ноду
+            </Button>
+          </div>
+
+          {nodes.length === 0 ? (
+            <Card>
+              <CardContent className="py-12">
+                <div className="flex flex-col items-center justify-center text-muted-foreground">
+                  <Server className="h-12 w-12 mb-4" />
+                  <p>Нет нод</p>
+                  <p className="text-sm mt-2">Добавьте ноду для распределённого управления</p>
+                </div>
+              </CardContent>
+            </Card>
+          ) : (
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+              {nodes.map(node => (
+                <Card
+                  key={node.id}
+                  className="cursor-pointer transition-all hover:shadow-lg hover:border-primary"
+                  onClick={() => setSelectedNode(node)}
+                >
+                  <CardContent className="p-6">
+                    <div className="flex items-start justify-between mb-4">
+                      <div className="flex items-center gap-2">
+                        <Server className="h-5 w-5 text-primary" />
+                        <span className="font-semibold text-lg">{node.name}</span>
+                      </div>
+                      <Badge variant={node.status === 'online' ? 'success' : 'secondary'}>
+                        {node.status || 'unknown'}
+                      </Badge>
+                    </div>
+                    <div className="space-y-2 text-sm">
+                      <div className="flex items-center gap-2">
+                        <span className="text-muted-foreground">Host:</span>
+                        <span className="font-mono">{node.host}</span>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <span className="text-muted-foreground">Port:</span>
+                        <span className="font-mono">{node.port}</span>
+                      </div>
+                    </div>
+                  </CardContent>
+                </Card>
+              ))}
+            </div>
+          )}
+        </div>
+        )}
+      </div>
+
+      {/* Notifications */}
+      <div className="fixed bottom-4 right-4 space-y-2 z-50">
+        {notifications.map(notif => (
+          <div
+            key={notif.id}
+            className={`px-4 py-3 rounded-lg shadow-lg animate-in slide-in-from-right ${
+              notif.type === 'error'
+                ? 'bg-destructive text-destructive-foreground'
+                : 'bg-primary text-primary-foreground'
+            }`}
+          >
+            {notif.message}
+          </div>
+        ))}
+      </div>
+
+      {/* Add Instance Dialog */}
+      <Dialog open={showAddForm} onOpenChange={setShowAddForm}>
+        <DialogContent onClose={() => setShowAddForm(false)} className="max-w-2xl max-h-[90vh] overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle>Добавить инстанс</DialogTitle>
+            <DialogDescription>Создайте новый OlcRTC инстанс</DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4 mt-4">
+            <div className="space-y-2">
+              <Label htmlFor="node_id">Нода</Label>
+              <Select
+                id="node_id"
+                value={newUser.node_id || 'local'}
+                onChange={(e) => setNewUser({ ...newUser, node_id: e.target.value })}
+              >
+                <option value="local">Локальная (этот сервер)</option>
+                {nodes.filter(n => n.status === 'online').map(node => (
+                  <option key={node.id} value={node.id}>
+                    {node.name} ({node.host}:{node.port})
+                  </option>
+                ))}
+              </Select>
+            </div>
+
+            <div className="space-y-2">
+              <Label htmlFor="client_id">Client ID (необязательно, legacy)</Label>
+              <div className="flex gap-2">
+                <Input
+                  id="client_id"
+                  placeholder="опционально — olcbox использует install-id устройства"
+                  value={newUser.client_id}
+                  onChange={(e) => setNewUser({ ...newUser, client_id: e.target.value })}
+                  className="flex-1"
+                />
+                <Button
+                  onClick={() => {
+                    const randomId = 'client-' + Math.random().toString(36).substring(2, 10);
+                    setNewUser({ ...newUser, client_id: randomId });
+                  }}
+                  variant="outline"
+                >
+                  Генерировать
+                </Button>
+              </div>
+            </div>
+
+            <div className="space-y-2">
+              <Label htmlFor="room_id">Room ID</Label>
+              <div className="flex gap-2">
+                <Input
+                  id="room_id"
+                  placeholder="https://telemost.yandex.ru/j/... или id встречи"
+                  value={newUser.room_id}
+                  onChange={(e) => setNewUser({ ...newUser, room_id: e.target.value })}
+                  onBlur={(e) => {
+                    const v = e.target.value;
+                    const m = v.match(/(?:https?:\/\/)?(?:www\.)?telemost\.yandex\.ru\/j\/([^\/?#]+)/i);
+                    if (m) setNewUser(prev => ({ ...prev, room_id: m[1] }));
+                  }}
+                  className="flex-1"
+                />
+              </div>
+            </div>
+
+            <div className="space-y-2">
+              <Label htmlFor="key">Encryption Key (64 hex chars)</Label>
+              <div className="flex gap-2">
+                <Input
+                  id="key"
+                  placeholder="64 символа hex"
+                  value={newUser.key}
+                  onChange={(e) => setNewUser({ ...newUser, key: e.target.value })}
+                  className="flex-1"
+                />
+                <Button onClick={generateKey} variant="outline">
+                  Генерировать
+                </Button>
+              </div>
+            </div>
+
+            <div className="space-y-2">
+              <Label htmlFor="profile_name">Profile Name (опционально)</Label>
+              <Input
+                id="profile_name"
+                placeholder="My Profile"
+                value={newUser.profile_name}
+                onChange={(e) => setNewUser({ ...newUser, profile_name: e.target.value })}
+              />
+            </div>
+
+            <div className="grid grid-cols-2 gap-4">
+              <div className="space-y-2">
+                <Label htmlFor="carrier">Carrier</Label>
+                <Input id="carrier" value="telemost" readOnly className="bg-muted" />
+                <p className="text-xs text-muted-foreground">Только Telemost — вставьте ссылку на встречу в Room ID</p>
+              </div>
+
+              <div className="space-y-2">
+                <Label htmlFor="transport">Transport</Label>
+                <Select
+                  id="transport"
+                  value={newUser.transport}
+                  onChange={(e) => setNewUser({ ...newUser, transport: e.target.value })}
+                >
+                  {transports.map(t => <option key={t} value={t}>{t}</option>)}
+                </Select>
+              </div>
+            </div>
+
+            <div className="space-y-2">
+              <Label htmlFor="dns">DNS Server</Label>
+              <Input
+                id="dns"
+                placeholder="1.1.1.1:53"
+                value={newUser.dns}
+                onChange={(e) => setNewUser({ ...newUser, dns: e.target.value })}
+              />
+            </div>
+
+            {transportParams.length > 0 && (
+              <div className="space-y-2 p-4 border rounded-lg">
+                <h3 className="font-semibold">Параметры транспорта</h3>
+                {transportParams.map(param => (
+                  <div key={param.name} className="space-y-2">
+                    <Label>{param.label}</Label>
+                    {param.type === 'select' ? (
+                      <Select
+                        value={newUser.transport_params[param.name] || param.default}
+                        onChange={(e) => setNewUser({
+                          ...newUser,
+                          transport_params: { ...newUser.transport_params, [param.name]: e.target.value }
+                        })}
+                      >
+                        {param.options.map(opt => <option key={opt} value={opt}>{opt}</option>)}
+                      </Select>
+                    ) : param.type === 'checkbox' ? (
+                      <input
+                        type="checkbox"
+                        checked={newUser.transport_params[param.name] || param.default}
+                        onChange={(e) => setNewUser({
+                          ...newUser,
+                          transport_params: { ...newUser.transport_params, [param.name]: e.target.checked }
+                        })}
+                        className="rounded"
+                      />
+                    ) : (
+                      <Input
+                        type="text"
+                        value={newUser.transport_params[param.name]}
+                        onChange={(e) => setNewUser({
+                          ...newUser,
+                          transport_params: { ...newUser.transport_params, [param.name]: e.target.value }
+                        })}
+                      />
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+
+            <div className="grid grid-cols-2 gap-4">
+              <div className="space-y-2">
+                <Label htmlFor="mode">Mode</Label>
+                <Select
+                  id="mode"
+                  value={newUser.mode}
+                  onChange={(e) => setNewUser({ ...newUser, mode: e.target.value })}
+                >
+                  <option value="srv">Server (srv)</option>
+                  <option value="cnc">Client (cnc)</option>
+                </Select>
+              </div>
+
+              <div className="space-y-2">
+                <Label htmlFor="socks_port">SOCKS5 Port (оставьте пустым для автовыбора)</Label>
+                <Input
+                  id="socks_port"
+                  type="number"
+                  placeholder="Автоматически"
+                  value={newUser.socks_port}
+                  onChange={(e) => setNewUser({ ...newUser, socks_port: e.target.value ? parseInt(e.target.value) : '' })}
+                />
+              </div>
+            </div>
+
+            {newUser.mode === 'srv' && (
+              <div className="space-y-2 p-4 border rounded-lg">
+                <h3 className="font-semibold">Ограничение скорости (KB/s)</h3>
+                <div className="grid grid-cols-2 gap-4">
+                  <div className="space-y-2">
+                    <Label htmlFor="rx_limit">RX Limit (Download)</Label>
+                    <Input
+                      id="rx_limit"
+                      type="number"
+                      placeholder="0 = без ограничений"
+                      value={newUser.rx_limit || 0}
+                      onChange={(e) => setNewUser({ ...newUser, rx_limit: parseInt(e.target.value) || 0 })}
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="tx_limit">TX Limit (Upload)</Label>
+                    <Input
+                      id="tx_limit"
+                      type="number"
+                      placeholder="0 = без ограничений"
+                      value={newUser.tx_limit || 0}
+                      onChange={(e) => setNewUser({ ...newUser, tx_limit: parseInt(e.target.value) || 0 })}
+                    />
+                  </div>
+                </div>
+              </div>
+            )}
+
+            <div className="flex items-center space-x-2">
+              <input
+                type="checkbox"
+                id="debug"
+                checked={newUser.debug}
+                onChange={(e) => setNewUser({ ...newUser, debug: e.target.checked })}
+                className="rounded"
+              />
+              <Label htmlFor="debug" className="cursor-pointer">Debug Mode</Label>
+            </div>
+
+            <Button onClick={addUser} className="w-full">
+              Создать инстанс
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      {/* Edit Instance Dialog */}
+      <Dialog open={showEditForm} onOpenChange={setShowEditForm}>
+        <DialogContent onClose={() => setShowEditForm(false)} className="max-w-2xl max-h-[90vh] overflow-y-auto">
+          {editingUser && (
+            <>
+              <DialogHeader>
+                <DialogTitle>Редактировать инстанс #{editingUser.id}</DialogTitle>
+                <DialogDescription>Изменить параметры инстанса</DialogDescription>
+              </DialogHeader>
+              <div className="space-y-4 mt-4">
+                <div className="space-y-2">
+                  <Label htmlFor="edit_node_id">Нода</Label>
+                  <Select
+                    id="edit_node_id"
+                    value={editingUser.node_id || 'local'}
+                    onChange={(e) => setEditingUser({ ...editingUser, node_id: e.target.value })}
+                  >
+                    <option value="local">Локальная (этот сервер)</option>
+                    {nodes.filter(n => n.status === 'online').map(node => (
+                      <option key={node.id} value={node.id}>
+                        {node.name} ({node.host}:{node.port})
+                      </option>
+                    ))}
+                  </Select>
+                </div>
+
+                <div className="space-y-2">
+                  <Label htmlFor="edit_client_id">Client ID (необязательно)</Label>
+                  <div className="flex gap-2">
+                    <Input
+                      id="edit_client_id"
+                      value={editingUser.client_id}
+                      onChange={(e) => setEditingUser({ ...editingUser, client_id: e.target.value })}
+                      className="flex-1"
+                    />
+                    <Button
+                      onClick={() => {
+                        const randomId = 'client-' + Math.random().toString(36).substring(2, 10);
+                        setEditingUser({ ...editingUser, client_id: randomId });
+                      }}
+                      variant="outline"
+                    >
+                      Генерировать
+                    </Button>
+                  </div>
+                </div>
+
+                <div className="space-y-2">
+                  <Label htmlFor="edit_key">Encryption Key</Label>
+                  <div className="flex gap-2">
+                    <Input
+                      id="edit_key"
+                      placeholder="64 символа hex"
+                      value={editingUser.key}
+                      onChange={(e) => setEditingUser({ ...editingUser, key: e.target.value })}
+                      className="flex-1"
+                    />
+                    <Button
+                      onClick={() => {
+                        const key = Array.from(crypto.getRandomValues(new Uint8Array(32)))
+                          .map(b => b.toString(16).padStart(2, '0'))
+                          .join('');
+                        setEditingUser({ ...editingUser, key });
+                      }}
+                      variant="outline"
+                    >
+                      Генерировать
+                    </Button>
+                  </div>
+                </div>
+
+                <div className="space-y-2">
+                  <Label htmlFor="edit_room_id">Room ID</Label>
+                  <div className="flex gap-2">
+                    <Input
+                      id="edit_room_id"
+                      placeholder="https://telemost.yandex.ru/j/... или id встречи"
+                      value={editingUser.room_id}
+                      onChange={(e) => setEditingUser({ ...editingUser, room_id: e.target.value })}
+                      onBlur={(e) => {
+                        const v = e.target.value;
+                        const m = v.match(/(?:https?:\/\/)?(?:www\.)?telemost\.yandex\.ru\/j\/([^\/?#]+)/i);
+                        if (m) setEditingUser(prev => ({ ...prev, room_id: m[1] }));
+                      }}
+                      className="flex-1"
+                    />
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-2 gap-4">
+                  <div className="space-y-2">
+                    <Label htmlFor="edit_carrier">Carrier</Label>
+                    <Input id="edit_carrier" value="telemost" readOnly className="bg-muted" />
+                  </div>
+
+                  <div className="space-y-2">
+                    <Label htmlFor="edit_transport">Transport</Label>
+                    <Select
+                      id="edit_transport"
+                      value={editingUser.transport}
+                      onChange={(e) => {
+                        setEditingUser({ ...editingUser, transport: e.target.value, transport_params: {} });
+                        fetchTransportParams(e.target.value);
+                      }}
+                    >
+                      {transports.map(t => <option key={t} value={t}>{t}</option>)}
+                    </Select>
+                  </div>
+                </div>
+
+                {transportParams.length > 0 && (
+                  <div className="space-y-2 p-4 border rounded-lg">
+                    <h3 className="font-semibold">Параметры транспорта</h3>
+                    {transportParams.map(param => (
+                      <div key={param.name} className="space-y-2">
+                        <Label>{param.label}</Label>
+                        {param.type === 'select' ? (
+                          <Select
+                            value={editingUser.transport_params[param.name] || param.default}
+                            onChange={(e) => setEditingUser({
+                              ...editingUser,
+                              transport_params: { ...editingUser.transport_params, [param.name]: e.target.value }
+                            })}
+                          >
+                            {param.options.map(opt => <option key={opt} value={opt}>{opt}</option>)}
+                          </Select>
+                        ) : param.type === 'checkbox' ? (
+                          <input
+                            type="checkbox"
+                            checked={editingUser.transport_params[param.name] || param.default}
+                            onChange={(e) => setEditingUser({
+                              ...editingUser,
+                              transport_params: { ...editingUser.transport_params, [param.name]: e.target.checked }
+                            })}
+                            className="rounded"
+                          />
+                        ) : (
+                          <Input
+                            type="text"
+                            value={editingUser.transport_params[param.name] || param.default}
+                            onChange={(e) => setEditingUser({
+                              ...editingUser,
+                              transport_params: { ...editingUser.transport_params, [param.name]: e.target.value }
+                            })}
+                          />
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                <div className="grid grid-cols-2 gap-4">
+                  <div className="space-y-2">
+                    <Label htmlFor="edit_mode">Mode</Label>
+                    <Select
+                      id="edit_mode"
+                      value={editingUser.mode}
+                      onChange={(e) => setEditingUser({ ...editingUser, mode: e.target.value })}
+                    >
+                      <option value="srv">srv (Server)</option>
+                      <option value="cnc">cnc (SOCKS5 Proxy)</option>
+                    </Select>
+                  </div>
+
+                  <div className="space-y-2">
+                    <Label htmlFor="edit_socks_port">SOCKS5 Port (оставьте пустым для автовыбора)</Label>
+                    <Input
+                      id="edit_socks_port"
+                      type="number"
+                      placeholder="Автоматически"
+                      value={editingUser.socks_port}
+                      onChange={(e) => setEditingUser({ ...editingUser, socks_port: e.target.value ? parseInt(e.target.value) : '' })}
+                    />
+                  </div>
+                </div>
+
+                <div className="space-y-2">
+                  <Label htmlFor="edit_profile_name">Profile Name (опционально)</Label>
+                  <Input
+                    id="edit_profile_name"
+                    value={editingUser.profile_name}
+                    onChange={(e) => setEditingUser({ ...editingUser, profile_name: e.target.value })}
+                  />
+                </div>
+
+                <div className="space-y-2">
+                  <Label htmlFor="edit_dns">DNS сервер</Label>
+                  <Input
+                    id="edit_dns"
+                    value={editingUser.dns}
+                    onChange={(e) => setEditingUser({ ...editingUser, dns: e.target.value })}
+                  />
+                </div>
+
+                {editingUser.mode === 'srv' && (
+                  <div className="space-y-2 p-4 border rounded-lg">
+                    <h3 className="font-semibold">Ограничение скорости (KB/s)</h3>
+                    <div className="grid grid-cols-2 gap-4">
+                      <div className="space-y-2">
+                        <Label htmlFor="edit_rx_limit">RX Limit (Download)</Label>
+                        <Input
+                          id="edit_rx_limit"
+                          type="number"
+                          placeholder="0 = без ограничений"
+                          value={editingUser.rx_limit || 0}
+                          onChange={(e) => setEditingUser({ ...editingUser, rx_limit: parseInt(e.target.value) || 0 })}
+                        />
+                      </div>
+                      <div className="space-y-2">
+                        <Label htmlFor="edit_tx_limit">TX Limit (Upload)</Label>
+                        <Input
+                          id="edit_tx_limit"
+                          type="number"
+                          placeholder="0 = без ограничений"
+                          value={editingUser.tx_limit || 0}
+                          onChange={(e) => setEditingUser({ ...editingUser, tx_limit: parseInt(e.target.value) || 0 })}
+                        />
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                <div className="flex items-center space-x-2">
+                  <input
+                    type="checkbox"
+                    id="edit_debug"
+                    checked={editingUser.debug}
+                    onChange={(e) => setEditingUser({ ...editingUser, debug: e.target.checked })}
+                    className="rounded"
+                  />
+                  <Label htmlFor="edit_debug" className="cursor-pointer">Debug Mode</Label>
+                </div>
+
+                <Button onClick={updateUser} className="w-full">
+                  Сохранить изменения
+                </Button>
+              </div>
+            </>
+          )}
+        </DialogContent>
+      </Dialog>
+
+      {/* QR Code Dialog */}
+      <Dialog open={showQrDialog} onOpenChange={setShowQrDialog}>
+        <DialogContent onClose={() => setShowQrDialog(false)} className="max-w-lg">
+          {qrCodeData && (
+            <>
+              <DialogHeader>
+                <DialogTitle>QR код инстанса #{qrCodeData.instanceId}</DialogTitle>
+                <DialogDescription>
+                  Отсканируйте QR код для подключения
+                </DialogDescription>
+              </DialogHeader>
+              <div className="space-y-4 mt-4">
+                <div className="flex justify-center p-4 bg-card border rounded-lg">
+                  <img
+                    src={qrCodeData.qrImage}
+                    alt="QR Code"
+                    className="w-full max-w-sm"
+                  />
+                </div>
+
+                <div className="space-y-2">
+                  <Label>URI</Label>
+                  <div className="p-2 bg-muted rounded font-mono text-xs break-all">
+                    {qrCodeData.uri}
+                  </div>
+                </div>
+
+                <div className="flex gap-2">
+                  <Button
+                    onClick={() => copyToClipboard(qrCodeData.uri, 'URI')}
+                    variant="outline"
+                    className="flex-1"
+                  >
+                    <Copy className="h-4 w-4 mr-2" />
+                    Копировать URI
+                  </Button>
+                  <Button
+                    onClick={downloadQrCode}
+                    className="flex-1"
+                  >
+                    Скачать QR
+                  </Button>
+                </div>
+              </div>
+            </>
+          )}
+        </DialogContent>
+      </Dialog>
+
+      {/* Subscription URLs Dialog */}
+      <Dialog open={showSubscriptionDialog} onOpenChange={setShowSubscriptionDialog}>
+        <DialogContent onClose={() => setShowSubscriptionDialog(false)} className="max-w-2xl">
+          <DialogHeader>
+            <DialogTitle>Subscription URLs</DialogTitle>
+            <DialogDescription>
+              Subscription по имени профиля / instance (Client ID не обязателен)
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4 mt-4">
+            {subscriptionUrls.map((item, index) => (
+              <div key={index} className="space-y-2">
+                <Label>Client ID: {item.clientId}</Label>
+                <div className="flex gap-2">
+                  <Input
+                    value={item.url}
+                    readOnly
+                    className="font-mono text-sm"
+                  />
+                  <Button
+                    onClick={() => {
+                      navigator.clipboard.writeText(item.url);
+                      showNotification(`URL для ${item.clientId} скопирован`);
+                    }}
+                    variant="outline"
+                  >
+                    <Copy className="h-4 w-4" />
+                  </Button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      {/* Add Node Dialog */}
+      <Dialog open={showAddNodeDialog} onOpenChange={setShowAddNodeDialog}>
+        <DialogContent onClose={() => setShowAddNodeDialog(false)} className="max-w-lg">
+          <DialogHeader>
+            <DialogTitle>Добавить ноду</DialogTitle>
+            <DialogDescription>
+              Добавьте новый сервер для распределённого развёртывания
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4 mt-4">
+            <div className="space-y-2">
+              <Label htmlFor="node_name">Название</Label>
+              <Input
+                id="node_name"
+                placeholder="Node 1"
+                value={newNode.name}
+                onChange={(e) => setNewNode({ ...newNode, name: e.target.value })}
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="node_host">Host (IP или домен)</Label>
+              <Input
+                id="node_host"
+                placeholder="192.168.1.100"
+                value={newNode.host}
+                onChange={(e) => setNewNode({ ...newNode, host: e.target.value })}
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="node_port">Port</Label>
+              <Input
+                id="node_port"
+                type="number"
+                value={newNode.port}
+                onChange={(e) => setNewNode({ ...newNode, port: parseInt(e.target.value) })}
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="node_token">Token (оставьте пустым для автогенерации)</Label>
+              <div className="flex gap-2">
+                <Input
+                  id="node_token"
+                  type="password"
+                  placeholder="Токен аутентификации ноды"
+                  value={newNode.token}
+                  onChange={(e) => setNewNode({ ...newNode, token: e.target.value })}
+                  className="flex-1"
+                />
+                <Button
+                  onClick={() => {
+                    const randomToken = Array.from(crypto.getRandomValues(new Uint8Array(32)))
+                      .map(b => b.toString(16).padStart(2, '0'))
+                      .join('');
+                    setNewNode({ ...newNode, token: randomToken });
+                  }}
+                  variant="outline"
+                >
+                  Генерировать
+                </Button>
+              </div>
+            </div>
+            <Button onClick={addNode} className="w-full">
+              Добавить ноду
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={showNodeSetupDialog} onOpenChange={setShowNodeSetupDialog}>
+        <DialogContent className="max-w-3xl max-h-[80vh] overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle>Настройка ноды</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-4">
+            <div>
+              <h3 className="font-semibold mb-2">Инструкции по установке:</h3>
+              <ol className="list-decimal list-inside space-y-1 text-sm">
+                <li>Создайте директорию на сервере: mkdir -p /opt/olcpanel-node && cd /opt/olcpanel-node</li>
+                <li>Создайте файл docker-compose.yml с содержимым ниже</li>
+                <li>Запустите: docker compose up -d</li>
+                <li>Проверьте статус: docker compose logs -f</li>
+              </ol>
+            </div>
+
+            {nodeSetupData && (
+              <>
+                <div>
+                  <div className="flex justify-between items-center mb-2">
+                    <h3 className="font-semibold">docker-compose.yml:</h3>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={() => {
+                        navigator.clipboard.writeText(nodeSetupData.docker_compose);
+                      }}
+                    >
+                      Копировать
+                    </Button>
+                  </div>
+                  <pre className="bg-gray-900 text-gray-100 p-3 rounded text-xs overflow-x-auto max-h-96">
+                    {nodeSetupData.docker_compose}
+                  </pre>
+                </div>
+
+                <div>
+                  <h3 className="font-semibold mb-2">Токен ноды:</h3>
+                  <div className="flex gap-2">
+                    <Input
+                      value={nodeSetupData.node.token}
+                      readOnly
+                      className="font-mono text-sm"
+                    />
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={() => {
+                        navigator.clipboard.writeText(nodeSetupData.node.token);
+                      }}
+                    >
+                      Копировать
+                    </Button>
+                  </div>
+                </div>
+              </>
+            )}
+
+            <Button onClick={() => setShowNodeSetupDialog(false)} className="w-full">
+              Закрыть
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      {/* Node Details Dialog */}
+      <Dialog open={selectedNode !== null} onOpenChange={() => setSelectedNode(null)}>
+        <DialogContent className="max-w-4xl max-h-[90vh] overflow-y-auto">
+          {selectedNode && (
+            <>
+              <DialogHeader>
+                <DialogTitle className="flex items-center gap-2">
+                  <Server className="h-5 w-5" />
+                  {selectedNode.name}
+                  <Badge variant={selectedNode.status === 'online' ? 'success' : 'secondary'}>
+                    {selectedNode.status || 'unknown'}
+                  </Badge>
+                </DialogTitle>
+              </DialogHeader>
+              <div className="space-y-6 mt-4">
+                {/* Node Info */}
+                <div className="grid grid-cols-2 gap-4">
+                  <div>
+                    <Label className="text-muted-foreground">Host</Label>
+                    <div className="font-mono text-sm mt-1">{selectedNode.host}</div>
+                  </div>
+                  <div>
+                    <Label className="text-muted-foreground">Port</Label>
+                    <div className="font-mono text-sm mt-1">{selectedNode.port}</div>
+                  </div>
+                  <div>
+                    <Label className="text-muted-foreground">Status</Label>
+                    <div className="text-sm mt-1">{selectedNode.status || 'unknown'}</div>
+                  </div>
+                  <div>
+                    <Label className="text-muted-foreground">Created</Label>
+                    <div className="text-sm mt-1">
+                      {selectedNode.created_at ? new Date(selectedNode.created_at * 1000).toLocaleString() : 'N/A'}
+                    </div>
+                  </div>
+                </div>
+
+                {/* Actions */}
+                <div className="flex gap-2">
+                  <Button
+                    variant="outline"
+                    onClick={async () => {
+                      const status = await checkNodeHealth(selectedNode.id);
+                      showNotification(`Нода ${selectedNode.name}: ${status}`);
+                    }}
+                    className="flex-1"
+                  >
+                    Проверить подключение
+                  </Button>
+                  <Button
+                    variant="destructive"
+                    onClick={() => {
+                      if (window.confirm(`Удалить ноду ${selectedNode.name}?`)) {
+                        deleteNode(selectedNode.id);
+                        setSelectedNode(null);
+                      }
+                    }}
+                  >
+                    <Trash2 className="h-4 w-4 mr-2" />
+                    Удалить ноду
+                  </Button>
+                </div>
+
+                {/* Running Instances */}
+                <div>
+                  <h3 className="font-semibold mb-3">Запущенные инстансы на этой ноде</h3>
+                  <div className="space-y-2">
+                    {users.filter(u => u.node_id === selectedNode.id && u.state === 'running').length === 0 ? (
+                      <p className="text-sm text-muted-foreground text-center py-4">
+                        Нет запущенных инстансов
+                      </p>
+                    ) : (
+                      users.filter(u => u.node_id === selectedNode.id && u.state === 'running').map(user => (
+                        <Card key={user.id}>
+                          <CardContent className="p-3">
+                            <div className="flex items-center justify-between">
+                              <div>
+                                <div className="font-mono text-sm">#{user.id} - {user.client_id}</div>
+                                <div className="text-xs text-muted-foreground">
+                                  {user.carrier} / {user.transport} / {user.mode}
+                                </div>
+                              </div>
+                              <Badge variant="success">Running</Badge>
+                            </div>
+                          </CardContent>
+                        </Card>
+                      ))
+                    )}
+                  </div>
+                </div>
+              </div>
+            </>
+          )}
+        </DialogContent>
+      </Dialog>
+
+      {/* Settings Dialog */}
+      <Dialog open={showSettingsDialog} onOpenChange={(v) => { setShowSettingsDialog(v); if (!v) setSettingsTab('security'); }}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>Настройки панели</DialogTitle>
+          </DialogHeader>
+
+          {/* Tab switcher */}
+          <div className="flex gap-1 p-1 bg-muted rounded-lg mt-2">
+            {[['security', 'Безопасность'], ['core', 'Ядро'], ['dev', 'Dev']].map(([id, label]) => (
+              <button
+                key={id}
+                onClick={() => setSettingsTab(id)}
+                className={`flex-1 py-1.5 px-3 rounded-md text-sm font-medium transition-colors ${
+                  settingsTab === id
+                    ? 'bg-background text-foreground shadow-sm'
+                    : 'text-muted-foreground hover:text-foreground'
+                }`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+
+          <div className="space-y-4 mt-2">
+            {/* Security tab */}
+            {settingsTab === 'security' && (
+              <>
+                <div className="space-y-2">
+                  <Label htmlFor="settings_username">Логин</Label>
+                  <Input
+                    id="settings_username"
+                    placeholder="admin"
+                    value={settingsForm.username}
+                    onChange={(e) => setSettingsForm({ ...settingsForm, username: e.target.value })}
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="settings_password">Текущий пароль</Label>
+                  <Input
+                    id="settings_password"
+                    type="password"
+                    placeholder="Введите текущий пароль"
+                    value={settingsForm.password}
+                    onChange={(e) => setSettingsForm({ ...settingsForm, password: e.target.value })}
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="settings_new_password">Новый пароль <span className="text-muted-foreground text-xs">(оставьте пустым чтобы не менять)</span></Label>
+                  <Input
+                    id="settings_new_password"
+                    type="password"
+                    placeholder="Новый пароль"
+                    value={settingsForm.newPassword}
+                    onChange={(e) => setSettingsForm({ ...settingsForm, newPassword: e.target.value })}
+                  />
+                </div>
+                <Button onClick={saveSecuritySettings} className="w-full">
+                  Сохранить
+                </Button>
+              </>
+            )}
+
+            {/* Core tab */}
+            {settingsTab === 'core' && (
+              <>
+                <div className="space-y-2">
+                  <Label htmlFor="settings_dns">DNS сервер по умолчанию</Label>
+                  <Input
+                    id="settings_dns"
+                    placeholder="1.1.1.1:53"
+                    value={settingsForm.dns}
+                    onChange={(e) => setSettingsForm({ ...settingsForm, dns: e.target.value })}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    DNS используется ядром OlcRTC для разрешения адресов carriers.
+                    Дефолт подставляется в форму создания новых инстансов.
+                  </p>
+                </div>
+                <Button onClick={saveCoreSettings} className="w-full">
+                  Сохранить
+                </Button>
+              </>
+            )}
+
+            {/* Dev tab */}
+            {settingsTab === 'dev' && (
+              <>
+                <div className="p-4 border border-yellow-600/30 rounded-lg bg-yellow-600/5 space-y-3">
+                  <p className="text-xs text-yellow-500 font-medium">⚠ Dev настройки для отладки</p>
+                  <div className="flex items-center space-x-2">
+                    <input
+                      type="checkbox"
+                      id="settings_debug"
+                      checked={settingsForm.debug}
+                      onChange={(e) => setSettingsForm({ ...settingsForm, debug: e.target.checked })}
+                      className="rounded"
+                    />
+                    <Label htmlFor="settings_debug" className="cursor-pointer">Debug режим (глобально)</Label>
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    Включает флаг <code className="bg-muted px-1 rounded">--debug</code> для всех запускаемых инстансов OlcRTC.
+                  </p>
+                </div>
+                <Button onClick={saveDevSettings} className="w-full">
+                  Сохранить
+                </Button>
+              </>
+            )}
+          </div>
+        </DialogContent>
+      </Dialog>
+
+    </div>
+  );
+}
+
+export default App;
