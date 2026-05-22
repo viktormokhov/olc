@@ -58,9 +58,11 @@ services:
     image: caddy:2-alpine
     container_name: olcpanel-caddy
     ports:
+      - "80:80"
       - "${PANEL_PORT:-808}:808"
     environment:
       PANEL_DOMAIN: ${PANEL_DOMAIN:-panel.example.com}
+      PANEL_PORT: ${PANEL_PORT:-808}
       ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL in .env for Let's Encrypt}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro

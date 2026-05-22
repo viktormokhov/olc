@@ -1,6 +1,13 @@
-# Caddy: use {$VAR}, not {env.VAR}. Env from docker-compose (PANEL_DOMAIN, ACME_EMAIL).
+# Caddy: use {$VAR}, not {env.VAR}. Env from docker-compose.
+# Port 80 (HTTP) — Let's Encrypt http-01; redirects to HTTPS on PANEL_PORT.
+# Port 808 inside container — panel UI (mapped to host PANEL_PORT).
+
 {
 	email {$ACME_EMAIL}
+}
+
+http://{$PANEL_DOMAIN} {
+	redir https://{$PANEL_DOMAIN}:{$PANEL_PORT}{uri} permanent
 }
 
 https://{$PANEL_DOMAIN}:808 {

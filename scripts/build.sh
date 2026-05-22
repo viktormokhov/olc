@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # Deprecated wrapper — use docker compose only.
 set -euo pipefail
 cd "$(dirname "$0")/.."

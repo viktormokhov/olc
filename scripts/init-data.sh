@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # Seed backend/data from examples/ (no secrets in git).
 set -euo pipefail
 

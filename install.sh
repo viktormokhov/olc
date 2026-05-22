@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # OlcPanel — first-time install (Docker Compose).
 set -euo pipefail
 
@@ -140,8 +140,10 @@ configure_ports() {
     yellow "No TTY — keeping PANEL_PORT / OLCRTC_SRV_PORT from .env"
     return
   fi
-  prompt_port PANEL_PORT "808" "HTTPS panel — host port for Caddy (container listens on 808 inside)"
+  prompt_port PANEL_PORT "808" "HTTPS panel — host port (Caddy HTTPS inside container :808)"
   prompt_port OLCRTC_SRV_PORT "8801" "olcrtc srv — KCP port for Olcbox / tunnel after Start in panel"
+  echo ""
+  yellow "  Port 80 is fixed (HTTP) — required for Let's Encrypt. Stop host nginx/apache on :80 if ACME fails."
 }
 
 echo "=== OlcPanel install ==="

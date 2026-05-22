@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # Copy overlay files into another OlcPanel directory (advanced).
 # Usage: ./scripts/install-overlay.sh /path/to/OlcPanel
 set -euo pipefail

@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # Remove one-off temp files from manual debugging on the VPS (safe to re-run).
 set -euo pipefail
 
