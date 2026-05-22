@@ -112,11 +112,36 @@ configure_env() {
   prompt_var SECRET_KEY "change-me" "JWT secret for API" 1 "$fresh"
 }
 
+# Ports: always ask in interactive install (separate step from domain/email).
+prompt_port() {
+  local key="$1" default="$2" hint="$3"
+  local current val shown
+
+  current=$(env_get "$key")
+  shown="${current:-$default}"
+
+  if [[ ! -t 0 ]]; then
+    env_set "$key" "$shown"
+    echo "  ${key}=${shown} (non-interactive)"
+    return
+  fi
+
+  echo ""
+  read -rp "  ${key} — ${hint}"$'\n'"       Current: ${shown}"$'\n'"       New value [Enter=${shown}]: " val || true
+  val=${val:-$shown}
+  env_set "$key" "$val"
+  echo "  → ${key}=${val}"
+}
+
 configure_ports() {
   echo ""
-  echo ">>> Access ports (open in firewall)"
-  prompt_var PANEL_PORT "808" "HTTPS panel (Caddy host port)" 0 0
-  prompt_var OLCRTC_SRV_PORT "8801" "olcrtc srv / Olcbox KCP" 0 0
+  echo ">>> Ports (each value entered separately; open them in firewall)"
+  if [[ ! -t 0 ]]; then
+    yellow "No TTY — keeping PANEL_PORT / OLCRTC_SRV_PORT from .env"
+    return
+  fi
+  prompt_port PANEL_PORT "808" "HTTPS panel — host port for Caddy (container listens on 808 inside)"
+  prompt_port OLCRTC_SRV_PORT "8801" "olcrtc srv — KCP port for Olcbox / tunnel after Start in panel"
 }
 
 echo "=== OlcPanel install ==="
