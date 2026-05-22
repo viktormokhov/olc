@@ -42,6 +42,9 @@ services:
     build:
       context: ./olcrtc
       dockerfile: Dockerfile
+      args:
+        OLCRTC_BRANCH: ${OLCRTC_BRANCH:-master}
+        OLCRTC_REPO: ${OLCRTC_REPO:-https://github.com/openlibrecommunity/olcrtc.git}
     image: ${OLCRTC_IMAGE:-olcrtc:patched}
     container_name: olcpanel-olcrtc-build
     entrypoint: []

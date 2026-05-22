@@ -1,12 +1,13 @@
 # olcrtc:patched — universal-carrier + defer carrier reconnect (Telemost/VP8)
 # Build: docker build -t olcrtc:patched -f olcrtc/Dockerfile olcrtc/
 
-FROM golang:1.26-alpine AS builder
+FROM golang:1.25-alpine AS builder
 
 RUN apk add --no-cache git ca-certificates python3
 
 ARG OLCRTC_REPO=https://github.com/openlibrecommunity/olcrtc.git
-ARG OLCRTC_BRANCH=refactor/universal-carrier
+# refactor/universal-carrier was merged; upstream only has master now
+ARG OLCRTC_BRANCH=master
 
 WORKDIR /src
 RUN git clone --depth 1 --branch "${OLCRTC_BRANCH}" --recurse-submodules "${OLCRTC_REPO}" .

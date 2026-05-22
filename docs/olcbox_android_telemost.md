@@ -58,5 +58,5 @@ olcrtc://telemost?vp8channel<vp8-fps=60&vp8-batch=64>@YOUR_MEETING_ID#<key>
 
 ## Ссылки
 
-- [olcrtc URI format](https://github.com/openlibrecommunity/olcrtc/blob/refactor/universal-carrier/docs/uri.md)
+- [olcrtc URI format](https://github.com/openlibrecommunity/olcrtc/blob/master/docs/uri.md)
 - [olcbox #56](https://github.com/alananisimov/olcbox/issues/56)

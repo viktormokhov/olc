@@ -31,7 +31,7 @@ def patch_dockerfile():
         "https://github.com/openlibrecommunity/olcrtc.git ."
     )
     new_clone = (
-        "RUN git clone --depth 1 --branch refactor/universal-carrier "
+        "RUN git clone --depth 1 --branch master "
         "--recurse-submodules https://github.com/openlibrecommunity/olcrtc.git ."
     )
     if old_clone in s:

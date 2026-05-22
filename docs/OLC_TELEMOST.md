@@ -233,7 +233,7 @@ Relay Active
 
 ## Ссылки
 
-- [olcrtc URI format](https://github.com/openlibrecommunity/olcrtc/blob/refactor/universal-carrier/docs/uri.md)
+- [olcrtc URI format](https://github.com/openlibrecommunity/olcrtc/blob/master/docs/uri.md)
 - [Olcbox nightly-universal-carrier](https://github.com/alananisimov/olcbox/releases/tag/nightly-universal-carrier)
 - [olcbox #56 — Telemost VP8](https://github.com/alananisimov/olcbox/issues/56)
 - Android: [`docs/olcbox_android_telemost.md`](olcbox_android_telemost.md)

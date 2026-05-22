@@ -6,7 +6,7 @@ OUT=/home/admin/OlcPanel/backend/data
 IMAGE=olcrtc-winbuild
 
 if [[ ! -d "$SRC/cmd/olcrtc" ]]; then
-  echo "Missing $SRC — clone olcrtc refactor/universal-carrier first"
+  echo "Missing $SRC — clone: git clone --depth 1 -b master https://github.com/openlibrecommunity/olcrtc.git $SRC"
   exit 1
 fi
 
